@@ -14,10 +14,11 @@
 #include <termios.h>
 #include <time.h>
 #include <unistd.h>
+#include <signal.h>
 
 /*** defines ***/
 
-static const char *HAKO_LOGO[] = {
+const char *HAKO_LOGO[29] = {
 " ++++++++++++++++++++++++++++++++++++++++++++++++++++++",
 " ++++++++++++++++++++++++++++++++++++++++++++++++++++++",
 " +++++++++++      ++++++++++++      +++++++++++++++++++",
@@ -49,7 +50,7 @@ static const char *HAKO_LOGO[] = {
 NULL
 };
 
-#define HAKO_VERSION "0.0.1"
+#define HAKO_VERSION "0.0.2"
 #define HAKO_TAB_STOP 8
 #define HAKO_QUIT_TIMES 3
 
@@ -125,10 +126,27 @@ struct editorConfig E;
 
 /*** filetypes ***/
 
+//c syntax
 char *C_HL_extensions[] = { ".c", ".h", ".cpp", NULL };
 char *C_HL_keywords[] = { "switch", "if", "while", "for", "break", "continue", "return", "else",
 			"struct", "union", "typedef", "static", "enum", "class", "case",
 			"int|", "long|", "double|", "float|", "char|", "unsigned|", "signed|", "void|", NULL
+};
+
+// python syntax
+char *PY_HL_extensions[] = { ".py", ".pyw", NULL };
+char *PY_HL_keywords[] = {
+	"def",		"class",	"if",		"elif",		"else",
+	"while",	"for",		"in",		"try",		"except",
+	"finally",	"with",		"as",		"pass",		"break",
+	"continue",	"return",	"yield",	"import",	"from",
+	"raise",	"global",	"nonlocal",	"assert",	"lambda",
+	"True",		"False",	"None",
+	"int|",		"float|",	"str|",		"bool|",	"list|",
+	"dict|",	"set|",		"tuple|",	"object|",
+	"bytes|",	"range|",	"enumerate|",
+	"len|",		"open|",	"print|",
+	NULL
 };
 
 struct editorSyntax HLDB[] = {
@@ -139,6 +157,13 @@ struct editorSyntax HLDB[] = {
 		"//", "/*", "*/",
 		HL_HIGHLIGHT_NUMBERS | HL_HIGHLIGHT_STRINGS
 	},
+	{
+		"python",
+		PY_HL_extensions,
+		PY_HL_keywords,
+		"#", "\"\"\"", "\"\"\"",
+		HL_HIGHLIGHT_NUMBERS | HL_HIGHLIGHT_STRINGS
+	}
 };
 
 #define HLDB_ENTRIES (sizeof(HLDB) / sizeof(HLDB[0]))
@@ -148,6 +173,7 @@ struct editorSyntax HLDB[] = {
 void editorSetStatusMessage(const char *fmt, ...);
 void editorRefreshScreen();
 char *editorPrompt(char *prompt, void (*callback)(char *, int));
+void editorUpdateWindowSize(void);
 
 /*** terminal ***/
 
@@ -176,6 +202,16 @@ void enableRawMode() {
 	raw.c_cc[VTIME] = 1;
 
 	if (tcsetattr(STDIN_FILENO, TCSAFLUSH, &raw) == -1) die("tcsetattr");
+}
+
+volatile sig_atomic_t winch_received = 0;
+
+// run whenever terminal resized.
+static void on_sigwinch(int signo) {
+	//signal resize”
+	winch_received = 1;
+	char dummy = 0;
+	write(STDIN_FILENO, &dummy, 1);
 }
 
 int editorReadKey() {
@@ -264,6 +300,13 @@ int getWindowSize(int *rows, int *cols) {
 		*rows = ws.ws_row;
 	return 0;
 	}
+}
+
+void editorUpdateWindowSize() {
+    int rows, cols;
+    if (getWindowSize(&rows, &cols) == -1) die("getWindowSize");
+    E.screenrows = rows - 2;
+    E.screencols = cols;
 }
 
 /*** syntax highlighting ***/
@@ -787,69 +830,104 @@ void editorDrawRows(struct abuf *ab) {
 	int y;
 	for (y = 0; y < E.screenrows; y++) {
 		int filerow = y + E.rowoff;
-		if (filerow  >= E.numrows) {
-			if (E.numrows == 0 && y == E.screenrows / 3) {
-				char welcome[80];
-				int welcomelen = snprintf(welcome, sizeof(welcome),
-					"HAKO -- version %s", HAKO_VERSION);
-				if (welcomelen > E.screencols) welcomelen = E.screencols;
-				int padding = (E.screencols - welcomelen) / 2;
-				if (padding) {
-					abAppend(ab, "~", 1);
-					padding--;
-				}	
-				while (padding--) abAppend(ab, " ", 1);
-				abAppend(ab, welcome, welcomelen);
-			}
-				else {
-				abAppend(ab, "~", 1);
-			}
-	}
-	else {
-		int len = E.row[filerow].rsize - E.coloff;
-		if (len < 0) len = 0;
-		if (len > E.screencols) len = E.screencols;
-		char *c = &E.row[filerow].render[E.coloff];
-		unsigned char *hl = &E.row[filerow].hl[E.coloff];
-		int current_color = -1;
-		int j;
-		for (j = 0; j < len; j++) {
-			if (iscntrl(c[j])) {
-				char sym = (c[j] <= 26) ? '@' + c[j] : '?';
-				abAppend(ab, "\x1b[7m", 4);
-				abAppend(ab, &sym, 1);
-				abAppend(ab, "\x1b[m", 3);
-				if (current_color != -1) {
-					char buf[16];
-					int clen = snprintf(buf, sizeof(buf), "\x1b[%dm", current_color);
-					abAppend(ab, buf, clen);
-				}
-			}
-			else if (hl[j] == HL_NORMAL) {
-				if (current_color != -1) {
-					abAppend(ab, "\x1b[39m", 5);
-					current_color = -1;
-				}
-				abAppend(ab, &c[j], 1);
-			}
-			else {
-				int color = editorSyntaxToColor(hl[j]);
-				if (color != current_color) {
-					current_color = color;
-					char buf[16];
-					int clen = snprintf(buf, sizeof(buf), "\x1b[%dm", color);
-					abAppend(ab, buf, clen);
-				}
-				abAppend(ab, &c[j], 1);
-			}
-		}
-		abAppend(ab, "\x1b[39m", 5);
-	}
-	abAppend(ab, "\x1b[K", 3);
-	abAppend(ab, "\r\n", 2);
-	}
-	
+
+		if (filerow >= E.numrows) {
+ 			// version + logo
+			if (E.numrows == 0) {
+                int logo_start_row = 4;
+
+                if (y == logo_start_row) {
+                    char version[80];
+                    int versionlen = snprintf(
+                        version, sizeof(version),
+                        "HAKO -- version %s", HAKO_VERSION
+                    );
+                    if (versionlen > E.screencols) versionlen = E.screencols;
+                    int padding = (E.screencols - versionlen) / 2;
+                    if (padding > 0) {
+                        // Print one “~” then pad with spaces
+                        abAppend(ab, "~", 1);
+                        padding--;
+                    }
+                    while (padding--) abAppend(ab, " ", 1);
+                    abAppend(ab, version, versionlen);
+                }
+                // 2) On the next 29 lines, center each line of HAKO_LOGO[0..28]
+                else if (y > logo_start_row && y <= logo_start_row + 28) {
+                    int logo_idx = y - (logo_start_row + 1);
+                    const char *line = HAKO_LOGO[logo_idx];
+                    int linelen = (line ? strlen(line) : 0);
+
+                    // If the logo is wider than the screen, truncate it:
+                    if (linelen > E.screencols) linelen = E.screencols;
+
+                    int padding = (E.screencols - linelen) / 2;
+                    if (padding > 0) {
+                        // Print one “~” then pad with spaces
+                        abAppend(ab, "~", 1);
+                        padding--;
+                    }
+                    while (padding--) abAppend(ab, " ", 1);
+
+                    if (line) {
+                        abAppend(ab, line, linelen);
+                    }
+                }
+                // 3) Any other empty row prints just “~”
+                else {
+                    abAppend(ab, "~", 1);
+                }
+            }
+            // If numrows > 0 (i.e. you’ve typed something), fall back to normal “~”:
+            else {
+                abAppend(ab, "~", 1);
+            }
+        }
+        // If there is actual file content on this row, draw it as usual:
+        else {
+            int len = E.row[filerow].rsize - E.coloff;
+            if (len < 0) len = 0;
+            if (len > E.screencols) len = E.screencols;
+            char *c = &E.row[filerow].render[E.coloff];
+            unsigned char *hl = &E.row[filerow].hl[E.coloff];
+            int current_color = -1;
+            for (int j = 0; j < len; j++) {
+                if (iscntrl(c[j])) {
+                    char sym = (c[j] <= 26) ? '@' + c[j] : '?';
+                    abAppend(ab, "\x1b[7m", 4);
+                    abAppend(ab, &sym, 1);
+                    abAppend(ab, "\x1b[m", 3);
+                    if (current_color != -1) {
+                        char buf[16];
+                        int clen = snprintf(buf, sizeof(buf), "\x1b[%dm", current_color);
+                        abAppend(ab, buf, clen);
+                    }
+                } else if (hl[j] == HL_NORMAL) {
+                    if (current_color != -1) {
+                        abAppend(ab, "\x1b[39m", 5);
+                        current_color = -1;
+                    }
+                    abAppend(ab, &c[j], 1);
+                } else {
+                    int color = editorSyntaxToColor(hl[j]);
+                    if (color != current_color) {
+                        current_color = color;
+                        char buf[16];
+                        int clen = snprintf(buf, sizeof(buf), "\x1b[%dm", color);
+                        abAppend(ab, buf, clen);
+                    }
+                    abAppend(ab, &c[j], 1);
+                }
+            }
+            abAppend(ab, "\x1b[39m", 5);
+        }
+
+        // Clear to end of line and move to next:
+        abAppend(ab, "\x1b[K", 3);
+        abAppend(ab, "\r\n", 2);
+    }
 }
+
 void editorDrawStatusBar(struct abuf *ab) {
 	abAppend(ab, "\x1b[7m", 4);
 	char status [80], rstatus[80];
@@ -883,6 +961,9 @@ void editorDrawMessageBar(struct abuf *ab) {
 }
 
 void editorRefreshScreen() {
+	//resize terminal every redraw
+	editorUpdateWindowSize();
+
 	editorScroll();
 
 	struct abuf ab = ABUF_INIT;
@@ -1093,12 +1174,25 @@ void initEditor() {
 	E.statusmsg_time = 0;
 	E.syntax = NULL;
 
-	if (getWindowSize(&E.screenrows, &E.screencols) == -1) die("getWindowSize");
-	E.screenrows -= 2;
+	// fetch terminal size
+	editorUpdateWindowSize();
 }
 
 int main(int argc, char *argv[]) {
+	//terminal in raw
 	enableRawMode();
+
+	// register SIGWINCH to catch resizes
+	struct sigaction sa;
+	sa.sa_handler = on_sigwinch;
+	sigemptyset(&sa.sa_mask);
+	sa.sa_flags = SA_RESTART;
+	if (sigaction(SIGWINCH, &sa, NULL) == -1) {
+		die("sigaction");
+	}
+
+
+	//initalize edtior
 	initEditor();
 	if (argc >= 2) {
 		editorOpen(argv[1]);
@@ -1106,8 +1200,17 @@ int main(int argc, char *argv[]) {
 
 	editorSetStatusMessage("HELP: Ctrl-S = Save | Ctrl-Q = quit | Ctrl-F = find");
 
+	//main loop, refreshing
 	while (1) {
 		editorRefreshScreen();
+
+		// handle resize before read key
+		if (winch_received) {
+			winch_received = 0;
+			editorUpdateWindowSize();
+			editorRefreshScreen();
+		}
+
 		editorProcessKeyPress();
 	}
 
