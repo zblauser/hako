@@ -1,0 +1,4 @@
+# ~/.hakorc
+tab_stop=4
+quit_times=2
+default_mode=normal

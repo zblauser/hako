@@ -8,6 +8,16 @@ designed for engineers who appreciate clarity, precision, and the elegance of mi
 
 ---
 
+## Change Log
+[v0.0.3]
+
+- Added familiar vi-inspired modes & commands (normal & insert, /, :, :w, :wq, :q); susceptible to change
+- Added language support for c++, c#, java, Rust, SQL, HTML/CSS, and Javascript (in addition to Python & C)
+- Established default font color theme
+- Implemented tt (go to line 1) and bb (go to last line) normal mode shortcuts
+
+---
+
 ## Usage
 #### Compile `hako.c`(ex. gcc)
 ```bash
@@ -17,8 +27,6 @@ gcc hako.c -o hako
 ```bash
 ./hako or ./hako [yourfile]
 ```
-#### Alternatively
-You may run the pre-compiled `./hako` file.
 
 Your terminal becomes a box that holds your code, structured and serene.
 
@@ -27,23 +35,33 @@ Your terminal becomes a box that holds your code, structured and serene.
 ## Current Timeline
 
 - Broadening syntax support
-	- `c`						[X]
-	- `c++`						[ ]
-	- `c#`						[ ]
-	- `python`					[X]
-	- `java`					[ ]
-	- `rust`					[ ]
-	- `SQL`						[ ]
-	- `html/css`				[ ]
+	- `C`									[X]
+	- `C++`									[X]
+	- `C#`									[X]
+	- `Python`								[X]
+	- `Java`								[X]
+	- `Rust`								[X]
+	- `SQL`									[X]
+	- `HTML/CSS`							[X]
+	- `Javascript`							[X]
+	- New syntax support in progress
 
 - Establishing a `.hakorc`file for configs
-	- create .hakorc			[ ]
-	- number settings			[ ]
-	- establish default theme	[ ]
+	- create .hakorc						[ ]
+	- various settings [tabs, hotkeys, etc]	[X]
+	- establish default theme				[X]
+	- rig more settings to rc				[ ]
+	- prime for plugin support				[ ]
 
 - Refine and create new key bindings
-	- modes						[ ]
-	- global identifer			[ ]
+	- modes [insert, normal]				[X]
+	- / for search							[X]
+	- :q for quit :w for write				[X]
+	- undo/redo								[ ]
+	- copy/paste							[ ]
+	- line # search							[ ]
+	- tt for top bb for bottom				[X]
+	- visual mode							[ ]
 
 ---
 
@@ -63,4 +81,3 @@ Please ensure your code follows the existing style.
 ## Thank you for your attention.
 If you hit any issues, feel free to open an issue on GitHub.
 Pull requests, suggestions, or even thoughtful discussions are welcome.
-
