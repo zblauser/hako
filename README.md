@@ -9,12 +9,16 @@ designed for engineers who appreciate clarity, precision, and the elegance of mi
 ---
 
 ## Change Log
-[v0.0.3]
+[v0.0.4]
 
 - Added familiar vi-inspired modes & commands (normal & insert, /, :, :w, :wq, :q); susceptible to change
-- Added language support for c++, c#, java, Rust, SQL, HTML/CSS, and Javascript (in addition to Python & C)
-- Established default font color theme
+- Line jump fuction via :NUMBER (ex. :120 goes to line 120)
+- Ctrl + f pages fwd ctrl + b pages bwd
 - Implemented tt (go to line 1) and bb (go to last line) normal mode shortcuts
+- Improved the fuzzy find triggered by /, use arrow keys or scroll to move between finds, enter/esc to exit
+- Added language support for c++, c#, java, Rust, SQL, HTML/CSS, and Javascript (in addition to Python & C)
+- Established default font color theme, found in .hakorc
+- Alternate-screen & clean exit, wiping the terminal
 
 ---
 
@@ -44,24 +48,27 @@ Your terminal becomes a box that holds your code, structured and serene.
 	- `SQL`									[X]
 	- `HTML/CSS`							[X]
 	- `Javascript`							[X]
-	- New syntax support in progress
+New syntax support in progress
 
 - Establishing a `.hakorc`file for configs
-	- create .hakorc						[ ]
+	- create .hakorc						[X]
 	- various settings [tabs, hotkeys, etc]	[X]
 	- establish default theme				[X]
+	- enhanced theme support				[ ]
 	- rig more settings to rc				[ ]
 	- prime for plugin support				[ ]
 
 - Refine and create new key bindings
 	- modes [insert, normal]				[X]
 	- / for search							[X]
+	- implement replace via /				[ ]
 	- :q for quit :w for write				[X]
 	- undo/redo								[ ]
 	- copy/paste							[ ]
-	- line # search							[ ]
+	- line # search							[X]
 	- tt for top bb for bottom				[X]
 	- visual mode							[ ]
+	- modulate and parse code seperately	[ ]
 
 ---
 
