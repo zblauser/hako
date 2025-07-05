@@ -1,4 +1,16 @@
 # ~/.hakorc
 tab_stop=4
-quit_times=2
-default_mode=normal
+quit_times=3
+mode=0
+
+# true-color text and background
+fg_color=#e0e0e0
+bg_color=#111131
+
+# then 0–255 for each highlight kind:
+comment_color=244
+keyword1_color=33
+keyword2_color=75
+string_color=173
+number_color=208
+match_color=42
