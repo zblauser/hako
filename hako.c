@@ -1,5 +1,5 @@
 /*** HAKO ***/
-#define HAKO_VERSION "0.0.4"
+#define HAKO_VERSION "0.0.5"
 
 
 /*** include ***/
@@ -73,6 +73,8 @@ NULL
 void disableRawMode(void);
 #undef exit
 #define exit(code) do { \
+	editorFreeUndoStack(&E.undo_stack); \
+	editorFreeUndoStack(&E.redo_stack); \
     disableRawMode();   \
     write(STDOUT_FILENO, "\033c", 2); \
     fflush(stdout);     \
@@ -117,6 +119,17 @@ struct abuf {
 	int len;
 };
 
+
+/*** undo/redo system ***/
+typedef struct undoState {
+	erow *rows;
+	int numrows;
+	int cx, cy;
+	char *filename;
+	struct undoState *next;
+} undoState;
+
+
 /*** prototypes ***/
 void editorDrawRows(struct abuf *ab);
 void editorDrawStatusBar(struct abuf *ab);
@@ -139,6 +152,19 @@ void editorFind(void);
 void editorJumpTop(void);
 void editorJumpBottom(void);
 int is_seperator(int c);
+void editorSaveState(void);
+void editorUndo(void);
+void editorRedo(void);
+void editorFreeUndoStack(undoState **stack);
+undoState *editorCreateUndoState(void);
+void editorRestoreState(undoState *state);
+void editorStartUndoBlock(void);
+void editorEndUndoBlock(void);
+int editorShouldBreakUndoBlock(void);
+void editorUpdateEditTime(void);
+void editorUpdateLineNumberWidth(void);
+void editorDrawLineNumber(struct abuf *ab, int filerow);
+
 
 /*** syntax highlighting rules ***/
 struct editorSyntax {
@@ -284,8 +310,19 @@ struct editorConfig {
 
 	//config
 	int tab_stop;
-	int quit_times;
 	enum editorMode mode;
+
+	int show_line_numbers;
+	int line_number_width;	
+
+	// undo/redo system
+	undoState *undo_stack;
+	undoState *redo_stack;
+	int max_undo_levels;
+
+	int undo_block_active;
+	time_t last_edit_time;
+	int last_edit_cx, last_edit_cy;
 
 	// theme
 	int fg_color;
@@ -410,6 +447,7 @@ void abFree(struct abuf *ab) {
 /*** editor screen ***/
 void editorRefreshScreen() {
 	editorUpdateWindowSize();
+	editorUpdateLineNumberWidth();
 
 	editorScroll();
 
@@ -423,7 +461,9 @@ void editorRefreshScreen() {
 	editorDrawMessageBar(&ab);
 
 	char buf[32];
-	snprintf(buf, sizeof(buf), "\x1b[%d;%dH", (E.cy - E.rowoff) + 1, (E.rx - E.coloff) + 1);
+	snprintf(buf, sizeof(buf), "\x1b[%d;%dH",
+		(E.cy - E.rowoff) + 1,
+		(E.rx - E.coloff) + E.line_number_width + 1);
 	abAppend(&ab, buf, strlen(buf));
 
 	abAppend(&ab, "\x1b[?25h", 6);
@@ -438,91 +478,94 @@ void editorDrawRows(struct abuf *ab) {
 		int filerow = y + E.rowoff;
 
 		if (filerow >= E.numrows) {
+			if (E.show_line_numbers) {
+				editorDrawLineNumber(ab, filerow);
+			} else {
+				abAppend(ab, "~", 1);
+			}
+			
 			if (E.numrows == 0) {
-                int logo_start_row = 4;
+				int logo_start_row = 4;
 
-                if (y == logo_start_row) {
-                    char version[80];
-                    int versionlen = snprintf(
-                        version, sizeof(version),
-                        "HAKO -- version %s", HAKO_VERSION
-                    );
-                    if (versionlen > E.screencols) versionlen = E.screencols;
-                    int padding = (E.screencols - versionlen) / 2;
-                    if (padding > 0) {
-                        abAppend(ab, "~", 1);
-                        padding--;
-                    }
-                    while (padding--) abAppend(ab, " ", 1);
-                    abAppend(ab, version, versionlen);
-                }
-                else if (y > logo_start_row && y <= logo_start_row + 28) {
-                    int logo_idx = y - (logo_start_row + 1);
-                    const char *line = HAKO_LOGO[logo_idx];
-                    int linelen = (line ? strlen(line) : 0);
+				if (y == logo_start_row) {
+					char version[80];
+					int versionlen = snprintf(
+						version, sizeof(version),
+						"HAKO -- version %s", HAKO_VERSION
+					);
+					if (versionlen > E.screencols - E.line_number_width) 
+						versionlen = E.screencols - E.line_number_width;
+					int padding = (E.screencols - E.line_number_width - versionlen) / 2;
+					if (padding > 0 && !E.show_line_numbers) {
+						padding--;
+					}
+					while (padding--) abAppend(ab, " ", 1);
+					abAppend(ab, version, versionlen);
+				}
+				else if (y > logo_start_row && y <= logo_start_row + 28) {
+					int logo_idx = y - (logo_start_row + 1);
+					const char *line = HAKO_LOGO[logo_idx];
+					int linelen = (line ? strlen(line) : 0);
 
-                    if (linelen > E.screencols) linelen = E.screencols;
+					if (linelen > E.screencols - E.line_number_width) 
+						linelen = E.screencols - E.line_number_width;
 
-                    int padding = (E.screencols - linelen) / 2;
-                    if (padding > 0) {
-                        abAppend(ab, "~", 1);
-                        padding--;
-                    }
-                    while (padding--) abAppend(ab, " ", 1);
+					int padding = (E.screencols - E.line_number_width - linelen) / 2;
+					if (padding > 0 && !E.show_line_numbers) {
+						padding--;
+					}
+					while (padding--) abAppend(ab, " ", 1);
 
-                    if (line) {
-                        abAppend(ab, line, linelen);
-                    }
-                }
-                else {
-                    abAppend(ab, "~", 1);
-                }
-            }
-            else {
-                abAppend(ab, "~", 1);
-            }
-        }
-        else {
-            int len = E.row[filerow].rsize - E.coloff;
-            if (len < 0) len = 0;
-            if (len > E.screencols) len = E.screencols;
-            char *c = &E.row[filerow].render[E.coloff];
-            unsigned char *hl = &E.row[filerow].hl[E.coloff];
-            int current_color = -1;
-            for (int j = 0; j < len; j++) {
-                if (iscntrl(c[j])) {
-                    char sym = (c[j] <= 26) ? '@' + c[j] : '?';
-                    abAppend(ab, "\x1b[7m", 4);
-                    abAppend(ab, &sym, 1);
-                    abAppend(ab, "\x1b[m", 3);
-                    if (current_color != -1) {
-                        char buf[16];
-                        int clen = snprintf(buf, sizeof(buf), "\x1b[%dm", current_color);
-                        abAppend(ab, buf, clen);
-                    }
-                } else if (hl[j] == HL_NORMAL) {
-                    if (current_color != -1) {
-                        abAppend(ab, "\x1b[39m", 5);
-                        current_color = -1;
-                    }
-                    abAppend(ab, &c[j], 1);
-                } else {
-                    int color = editorSyntaxToColor(hl[j]);
-                    if (color != current_color) {
-                        current_color = color;
-                        char buf[16];
-                        int clen = snprintf(buf, sizeof(buf), "\x1b[%dm", color);
-                        abAppend(ab, buf, clen);
-                    }
-                    abAppend(ab, &c[j], 1);
-                }
-            }
-            abAppend(ab, "\x1b[39m", 5);
-        }
+					if (line) {
+						abAppend(ab, line, linelen);
+					}
+				}
+			}
+		}
+		else {
+			editorDrawLineNumber(ab, filerow);
+			
+			int len = E.row[filerow].rsize - E.coloff;
+			if (len < 0) len = 0;
+			if (len > E.screencols - E.line_number_width) 
+				len = E.screencols - E.line_number_width;
+			char *c = &E.row[filerow].render[E.coloff];
+			unsigned char *hl = &E.row[filerow].hl[E.coloff];
+			int current_color = -1;
+			for (int j = 0; j < len; j++) {
+				if (iscntrl(c[j])) {
+					char sym = (c[j] <= 26) ? '@' + c[j] : '?';
+					abAppend(ab, "\x1b[7m", 4);
+					abAppend(ab, &sym, 1);
+					abAppend(ab, "\x1b[m", 3);
+					if (current_color != -1) {
+						char buf[16];
+						int clen = snprintf(buf, sizeof(buf), "\x1b[%dm", current_color);
+						abAppend(ab, buf, clen);
+					}
+				} else if (hl[j] == HL_NORMAL) {
+					if (current_color != -1) {
+						abAppend(ab, "\x1b[39m", 5);
+						current_color = -1;
+					}
+					abAppend(ab, &c[j], 1);
+				} else {
+					int color = editorSyntaxToColor(hl[j]);
+					if (color != current_color) {
+						current_color = color;
+						char buf[16];
+						int clen = snprintf(buf, sizeof(buf), "\x1b[%dm", color);
+						abAppend(ab, buf, clen);
+					}
+					abAppend(ab, &c[j], 1);
+				}
+			}
+			abAppend(ab, "\x1b[39m", 5);
+		}
 
-        abAppend(ab, "\x1b[K", 3);
-        abAppend(ab, "\r\n", 2);
-    }
+		abAppend(ab, "\x1b[K", 3);
+		abAppend(ab, "\r\n", 2);
+	}
 }
 
 void editorDrawStatusBar(struct abuf *ab) {
@@ -580,8 +623,8 @@ void editorScroll() {
 	if (E.rx < E.coloff) {
 		E.coloff = E.rx;
 	}
-	if (E.rx >= E.coloff + E.screencols) {
-		E.coloff = E.rx - E.screencols + 1;
+	if (E.rx >= E.coloff + E.screencols - E.line_number_width) {
+		E.coloff = E.rx - E.screencols + E.line_number_width + 1;
 	}
 }
 
@@ -745,7 +788,6 @@ void editorSelectSyntaxHighlight() {
 }
 
 
-
 /*** config ***/
 void editorLoadConfig() {
 	FILE *fp = NULL;
@@ -783,12 +825,9 @@ void editorLoadConfig() {
 		if (strcmp(key, "tab_stop") == 0) {
 			E.tab_stop = atoi(val);
 		}
-		else if (strcmp(key, "quit_times") == 0) {
-			E.quit_times = atoi(val);
-		}
 		else if (strcmp(key, "mode") == 0) {
-			if (strcmp(val, "insert") == 0) E.mode = 0;
-			else if (strcmp(val, "normal") == 0) E.mode = 1;
+			if (strcmp(val, "insert") == 0) E.mode = 1;
+			else if (strcmp(val, "normal") == 0) E.mode = 0;
 		}
 
 		else if (strcmp(key, "fg_color") == 0) {
@@ -818,6 +857,9 @@ void editorLoadConfig() {
 		}
 		else if (strcmp(key, "match_color") == 0) {
 			E.color_match = atoi(val);
+		}
+		else if (strcmp(key, "show_line_numbers") == 0) {
+			E.show_line_numbers = atoi(val);
 		}
 	}
 	free(line);
@@ -934,6 +976,16 @@ void editorRowDelChar(erow *row, int at) {
 }
 
 void editorInsertChar(int c) {
+
+	if (editorShouldBreakUndoBlock()) {
+		editorEndUndoBlock();
+		editorStartUndoBlock();
+	} else if (!E.undo_block_active) {
+		editorStartUndoBlock();
+	}
+	
+	editorUpdateEditTime();
+
 	if (E.cy == E.numrows) {
 		editorInsertRow(E.numrows, "", 0);
 	}
@@ -942,10 +994,18 @@ void editorInsertChar(int c) {
 }
 
 void editorInsertNewLine() {
+	if (E.undo_block_active) {
+		editorEndUndoBlock();
+	}
+	editorStartUndoBlock();
+
+	while (E.cy >= E.numrows) {
+		editorInsertRow(E.numrows, "", 0);
+	}
+
 	if (E.cx == 0) {
 		editorInsertRow(E.cy, "", 0);
-	}
-	else {
+	} else {
 		erow *row = &E.row[E.cy];
 		editorInsertRow(E.cy + 1, &row->chars[E.cx], row->size - E.cx);
 		row = &E.row[E.cy];
@@ -955,11 +1015,23 @@ void editorInsertNewLine() {
 	}
 	E.cy++;
 	E.cx = 0;
+	
 }
 
 void editorDelChar() {
 	if (E.cy == E.numrows) return;
 	if (E.cx == 0 && E.cy == 0) return;
+
+	if (E.numrows == 0) return;
+
+	if (editorShouldBreakUndoBlock()) {
+		editorEndUndoBlock();
+		editorStartUndoBlock();
+	} else if (!E.undo_block_active) {
+		editorStartUndoBlock();
+	}
+	
+	editorUpdateEditTime();
 
 	erow *row = &E.row[E.cy];
 	if (E.cx > 0) {
@@ -1058,6 +1130,238 @@ char *editorRowsToString(int *buflen) {
 }
 
 
+/*** undo/redo system ***/
+void editorStartUndoBlock(void) {
+	if (!E.undo_block_active) {
+		editorSaveState();
+		E.undo_block_active = 1;
+		E.last_edit_time = time(NULL);
+		E.last_edit_cx = E.cx;
+		E.last_edit_cy = E.cy;
+	}
+}
+
+void editorEndUndoBlock(void) {
+	E.undo_block_active = 0;
+}
+
+int editorShouldBreakUndoBlock(void) {
+	if (!E.undo_block_active) return 0;
+	
+	time_t now = time(NULL);
+	
+	if (now - E.last_edit_time > 1) return 1;
+	
+	int cx_diff = abs(E.cx - E.last_edit_cx);
+	int cy_diff = abs(E.cy - E.last_edit_cy);
+	if (cy_diff > 0 || cx_diff > 1) return 1;
+	
+	return 0;
+}
+
+void editorUpdateEditTime(void) {
+	E.last_edit_time = time(NULL);
+	E.last_edit_cx = E.cx;
+	E.last_edit_cy = E.cy;
+}
+
+undoState *editorCreateUndoState(void) {
+	undoState *state = malloc(sizeof(undoState));
+	if (!state) return NULL;
+	
+	state->numrows = E.numrows;
+	state->cx = E.cx;
+	state->cy = E.cy;
+	state->filename = E.filename ? strdup(E.filename) : NULL;
+	state->next = NULL;
+	
+	if (E.numrows > 0) {
+		state->rows = malloc(sizeof(erow) * E.numrows);
+		for (int i = 0; i < E.numrows; i++) {
+			state->rows[i].size = E.row[i].size;
+			state->rows[i].chars = malloc(E.row[i].size + 1);
+			memcpy(state->rows[i].chars, E.row[i].chars, E.row[i].size + 1);
+			
+			state->rows[i].rsize = 0;
+			state->rows[i].render = NULL;
+			state->rows[i].hl = NULL;
+			state->rows[i].hl_open_comment = 0;
+			state->rows[i].idx = i;
+		}
+	} else {
+		state->rows = NULL;
+	}
+	
+	return state;
+}
+
+void editorSaveState(void) {
+	int count = 0;
+	undoState *current = E.undo_stack;
+	while (current && count < E.max_undo_levels) {
+		current = current->next;
+		count++;
+	}
+	
+	if (count >= E.max_undo_levels && E.undo_stack) {
+		undoState *temp = E.undo_stack;
+		while (temp->next && temp->next->next) {
+			temp = temp->next;
+		}
+		if (temp->next) {
+			editorFreeUndoStack(&temp->next);
+			temp->next = NULL;
+		}
+	}
+	
+	undoState *state = editorCreateUndoState();
+	if (!state) return;
+	
+	state->next = E.undo_stack;
+	E.undo_stack = state;
+	
+	editorFreeUndoStack(&E.redo_stack);
+}
+
+void editorRestoreState(undoState *state) {
+	for (int i = 0; i < E.numrows; i++) {
+		editorFreeRow(&E.row[i]);
+	}
+	free(E.row);
+	
+	E.numrows = state->numrows;
+	E.cx = state->cx;
+	E.cy = state->cy;
+	
+	if (state->numrows > 0) {
+		E.row = malloc(sizeof(erow) * state->numrows);
+		for (int i = 0; i < state->numrows; i++) {
+			E.row[i].size = state->rows[i].size;
+			E.row[i].chars = malloc(state->rows[i].size + 1);
+			memcpy(E.row[i].chars, state->rows[i].chars, state->rows[i].size + 1);
+			E.row[i].idx = i;
+			
+			E.row[i].rsize = 0;
+			E.row[i].render = NULL;
+			E.row[i].hl = NULL;
+			E.row[i].hl_open_comment = 0;
+			editorUpdateRow(&E.row[i]);
+		}
+	} else {
+		E.row = NULL;
+	}
+	
+	if (E.cy >= E.numrows) E.cy = E.numrows > 0 ? E.numrows - 1 : 0;
+	if (E.cy < 0) E.cy = 0;
+	
+	erow *row = (E.cy >= E.numrows) ? NULL : &E.row[E.cy];
+	int rowlen = row ? row->size : 0;
+	if (E.cx > rowlen) E.cx = rowlen;
+	
+	E.dirty++;
+}
+
+void editorUndo(void) {
+	if (!E.undo_stack) {
+		editorSetStatusMessage("Nothing to undo");
+		return;
+	}
+	
+	undoState *current_state = editorCreateUndoState();
+	if (current_state) {
+		current_state->next = E.redo_stack;
+		E.redo_stack = current_state;
+	}
+	
+	undoState *state = E.undo_stack;
+	E.undo_stack = state->next;
+	
+	editorRestoreState(state);
+	
+	free(state->filename);
+	for (int i = 0; i < state->numrows; i++) {
+		free(state->rows[i].chars);
+	}
+	free(state->rows);
+	free(state);
+	
+	editorSetStatusMessage("Undo successful");
+}
+
+void editorRedo(void) {
+	if (!E.redo_stack) {
+		editorSetStatusMessage("Nothing to redo");
+		return;
+	}
+	
+	undoState *current_state = editorCreateUndoState();
+	if (current_state) {
+		current_state->next = E.undo_stack;
+		E.undo_stack = current_state;
+	}
+	
+	undoState *state = E.redo_stack;
+	E.redo_stack = state->next;
+	
+	editorRestoreState(state);
+	
+	free(state->filename);
+	for (int i = 0; i < state->numrows; i++) {
+		free(state->rows[i].chars);
+	}
+	free(state->rows);
+	free(state);
+	
+	editorSetStatusMessage("Redo successful");
+}
+
+void editorFreeUndoStack(undoState **stack) {
+	while (*stack) {
+		undoState *temp = *stack;
+		*stack = (*stack)->next;
+		
+		free(temp->filename);
+		for (int i = 0; i < temp->numrows; i++) {
+			free(temp->rows[i].chars);
+		}
+		free(temp->rows);
+		free(temp);
+	}
+}
+
+
+/*** line numbers ***/
+void editorUpdateLineNumberWidth() {
+	if (!E.show_line_numbers) {
+		E.line_number_width = 0;
+	} else {
+		E.line_number_width = 4;
+	}
+}
+
+void editorDrawLineNumber(struct abuf *ab, int filerow) {
+	if (!E.show_line_numbers) return;
+	
+	int number;
+	if (E.show_line_numbers == 1) {
+		number = filerow + 1;
+	} else {
+		if (filerow == E.cy) {
+			number = 1;
+		} else {
+			number = abs(filerow - E.cy) + 1;
+		}
+	}
+	
+	char line_num[8];
+	snprintf(line_num, sizeof(line_num), "%3d ", number);
+	
+	abAppend(ab, "\x1b[90m", 5);
+	abAppend(ab, line_num, 4);
+	abAppend(ab, "\x1b[39m", 5);
+}
+
+
 /*** input & cursor ***/
 int editorReadKey() {
 	int nread;
@@ -1130,7 +1434,7 @@ void editorMoveCursor(int key) {
 			if (row && E.cx < row->size) {	
 				E.cx++;
 			}
-			else if (row && E.cx == row->size) {
+			else if (row && E.cx == row->size && E.cy + 1 < E.numrows) {
 				E.cy++;
 				E.cx = 0;
 			}
@@ -1141,7 +1445,7 @@ void editorMoveCursor(int key) {
 			}
 			break;
 		case ARROW_DOWN:
-			if (E.cy != E.numrows) {
+			if (E.cy + 1 < E.numrows) {
 				E.cy++;
 			}
 			break;
@@ -1164,6 +1468,14 @@ void editorProcessKeyPress() {
 			case 'i':
 				E.mode = MODE_INSERT;
 				editorSetStatusMessage("-- INSERT --");
+				break;
+
+			case 'u': 
+				editorUndo();
+				break;
+
+			case CTRL_KEY('r'):
+				editorRedo();
 				break;
 
 			case 'q':
@@ -1198,8 +1510,10 @@ void editorProcessKeyPress() {
 				}
 				last_char = 'b';
 				break;
+
 			case 'd':
 				if (last_char == 'd') {
+					editorSaveState();
 					editorDelRow(E.cy);
 
 					if (E.numrows == 0) {
@@ -1248,9 +1562,13 @@ void editorProcessKeyPress() {
 	}
 	else if (E.mode == MODE_INSERT) {
 		switch (c) {
-			case '\r':
-				editorInsertNewLine();
-				break;
+
+
+
+			case '\r': {
+			    editorInsertNewLine();
+			    break;
+			}
 
 			case BACKSPACE:
 			case CTRL_KEY('h'):
@@ -1271,6 +1589,7 @@ void editorProcessKeyPress() {
 				break;
 
 			case '\x1b':
+				editorEndUndoBlock();
 				E.mode = MODE_NORMAL;
 				editorSetStatusMessage("-- NORMAL --");
 				break;
@@ -1394,10 +1713,22 @@ void editorFind() {
 void editorColonCommand() {
 	char *cmd = editorPrompt(":%s", NULL);
 	if (cmd == NULL) return;
+
 	if (isdigit((unsigned char)cmd[0])) {
 		int line = atoi(cmd);
-		if (line < 1)         line = 1;
-		if (line > E.numrows) line = E.numrows;
+		if (line < 1) line = 1;
+		
+		if (E.numrows == 0) {
+			editorSetStatusMessage("No lines in file");
+			free(cmd);
+			return;
+		}
+		
+		if (line > E.numrows) {
+			line = E.numrows;
+			editorSetStatusMessage("Line %d out of range, moved to line %d", atoi(cmd), line);
+		}
+
 		E.cy     = line - 1;
 		E.cx     = 0;
 		E.rowoff = E.cy;
@@ -1445,14 +1776,21 @@ void initEditor() {
 	E.numrows = 0;
 	E.row = NULL;
 	E.dirty = 0;
-	E.mode = MODE_INSERT;
-	E.mode = 0;
+	E.mode = MODE_NORMAL;
 	E.filename = NULL;
 	E.statusmsg[0] = '\0';
 	E.statusmsg_time = 0;
 	E.syntax = NULL;
 	E.tab_stop = 8;
-	E.quit_times = 3;
+	E.max_undo_levels = 100;
+	E.undo_stack = NULL;
+	E.redo_stack = NULL;
+	E.undo_block_active = 0;
+	E.last_edit_time = 0;
+	E.last_edit_cx = 0;
+	E.last_edit_cy = 0;
+	E.show_line_numbers = 1;
+	E.line_number_width = 0;
 
 	E.fg_color = 0xE0E0E0;
 	E.bg_color = 0x1E1E1E;
@@ -1480,11 +1818,6 @@ void editorUpdateWindowSize() {
 int main(int argc, char *argv[]) {
 	initEditor();
 	enableRawMode();
-
-	char dbg[64];
-	int n = snprintf(dbg, sizeof(dbg), "fg=#%06x bg=#%06x", E.fg_color, E.bg_color);
-	write(STDOUT_FILENO, dbg, n);
-	fflush(stdout);
 		
 	struct sigaction sa;
 	sa.sa_handler = on_sigwinch;

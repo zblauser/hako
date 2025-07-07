@@ -1,16 +1,63 @@
 # ~/.hakorc
+# ===== EDITOR BEHAVIOR =====
+# Tab width (number of spaces per tab)
 tab_stop=4
-quit_times=3
-mode=0
 
-# true-color text and background
-fg_color=#e0e0e0
-bg_color=#111131
+# Default editor mode on startup
+# Options: “normal” or “insert”
+mode=normal
 
-# then 0–255 for each highlight kind:
+# ===== DISPLAY SETTINGS =====
+# Show line numbers on the left
+# 0=off, 1=absolute numbers (1,2,3…), 2=relative numbers (future feature)
+show_line_numbers=0
+
+# ===== UNDO/REDO SYSTEM =====
+# Maximum number of undo levels to keep in memory
+# Higher values use more memory but provide more undo history
+max_undo_levels=100
+
+# ===== COLOR THEME =====
+# Terminal foreground and background colors (hex format)
+# Remove # prefix when specifying hex colors
+fg_color=E0E0E0
+bg_color=1E1E1E
+
+# ===== SYNTAX HIGHLIGHTING COLORS =====
+# ANSI color codes for different syntax elements
+# Standard ANSI colors: 30-37 (dark), 90-97 (bright)
+# Extended colors: 0-255 for terminals that support them
+# Comments (// /* */ # etc.)
 comment_color=244
+
+# Keywords (if, while, for, function, etc.)
 keyword1_color=33
+
+# Type keywords (int, string, void, etc.)
 keyword2_color=75
+
+# String literals (“hello world”)
 string_color=173
+
+# Numbers (123, 3.14, 0xFF)
 number_color=208
+
+# Search match highlighting
 match_color=42
+
+# ===== EXAMPLE ALTERNATIVE THEMES =====
+# Dark theme (default above)
+# fg_color=E0E0E0
+# bg_color=1E1E1E
+# Light theme (uncomment to use)
+# fg_color=2E3440
+# bg_color=ECEFF4
+# High contrast theme (uncomment to use)
+# fg_color=FFFFFF
+# bg_color=000000
+
+# ===== NOTES =====
+# - Colors support both hex (without #) and ANSI codes
+# - Settings take effect immediately when you restart HAKO
+# - Invalid values fall back to defaults
+# - Project .hakorc overrides home ~/.hakorc

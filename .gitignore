@@ -11,6 +11,7 @@ vcontrol/
 
 # build
 build/
+hako
 
 # macOS
 .DS_Store
@@ -43,4 +44,3 @@ venv.bak/
 
 # macOS quarantine
 **/._*
-
