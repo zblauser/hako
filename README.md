@@ -9,8 +9,23 @@ designed for engineers who appreciate clarity, precision, and the elegance of mi
 ---
 
 ## Change Log
-[v0.0.4]
+[v0.0.5]
 
+*Features & Quality of Life*
+- While I'm not looking to create another neovim, there are many features of vim I do enjoy
+- More vi-like functionality with undo (u in normal)/redo (ctrl + r in normal) blocks
+- Undo blocks function with time, action, and mode based boundries
+- Configuarable undo levels, located in .hakorc (default=100)
+- Options for number and relative number mode, replacing (ex. "~" with "1") available in .hakorc
+- Number mode currently supports up 4 characters (ex. 9999 lines) 
+
+*Bug Fixes*
+- Fixed terminal crashing from invalid line jumps
+- Corrected cursor positioning and edge cases partaining to empty file navigation
+- Removed duplicate code and minor debug output left in from previous testing
+
+
+[v0.0.2-0.0.4]
 - Added familiar vi-inspired modes & commands (normal & insert, /, :, :w, :wq, :q); susceptible to change
 - Line jump fuction via :NUMBER (ex. :120 goes to line 120)
 - Ctrl + f pages fwd ctrl + b pages bwd
@@ -46,29 +61,31 @@ Your terminal becomes a box that holds your code, structured and serene.
 	- `Java`								[X]
 	- `Rust`								[X]
 	- `SQL`									[X]
-	- `HTML/CSS`							[X]
-	- `Javascript`							[X]
+	- `HTML/CSS`								[X]
+	- `Javascript`								[X]
 New syntax support in progress
 
 - Establishing a `.hakorc`file for configs
-	- create .hakorc						[X]
-	- various settings [tabs, hotkeys, etc]	[X]
-	- establish default theme				[X]
-	- enhanced theme support				[ ]
-	- rig more settings to rc				[ ]
-	- prime for plugin support				[ ]
+	- create .hakorc							[X]
+	- various settings [tabs, hotkeys, etc]					[X]
+	- establish default theme						[X]
+	- enhanced theme support						[ ]
+	- rig settings like theme color, number mode, etc to .hakorc		[X]
+	- prime for plugin support						[ ]
 
 - Refine and create new key bindings
-	- modes [insert, normal]				[X]
-	- / for search							[X]
-	- implement replace via /				[ ]
-	- :q for quit :w for write				[X]
-	- undo/redo								[ ]
-	- copy/paste							[ ]
-	- line # search							[X]
-	- tt for top bb for bottom				[X]
-	- visual mode							[ ]
-	- modulate and parse code seperately	[ ]
+	- modes [insert, normal]						[X]
+	- / for search								[X]
+	- implement replace via /						[ ]
+	- :q for quit :w for write						[X]
+	- undo/redo								[X]
+	- copy/paste								[ ]
+	- line # search								[X]
+	- ctrl + f jump forward, ctrl + b jump back				[X]
+	- tt for top bb for bottom						[X]
+	- numbered mode, with ordered and relative options			[X]
+	- visual mode								[ ]
+	- modulate and parse code seperately					[ ]
 
 ---
 
