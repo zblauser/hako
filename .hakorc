@@ -1,29 +1,37 @@
 # ~/.hakorc
+
 # ===== EDITOR BEHAVIOR =====
 # Tab width (number of spaces per tab)
 tab_stop=4
+
+# Number of Ctrl+Q presses required to force quit with unsaved changes
+quit_times=3
 
 # Default editor mode on startup
 # Options: “normal” or “insert”
 mode=normal
 
 # ===== DISPLAY SETTINGS =====
+
 # Show line numbers on the left
-# 0=off, 1=absolute numbers (1,2,3…), 2=relative numbers (future feature)
+# 0=off, 1=absolute numbers (1,2,3..), 2=relative numbers
 show_line_numbers=0
 
 # ===== UNDO/REDO SYSTEM =====
+
 # Maximum number of undo levels to keep in memory
 # Higher values use more memory but provide more undo history
 max_undo_levels=100
 
 # ===== COLOR THEME =====
+
 # Terminal foreground and background colors (hex format)
 # Remove # prefix when specifying hex colors
 fg_color=E0E0E0
 bg_color=1E1E1E
 
 # ===== SYNTAX HIGHLIGHTING COLORS =====
+
 # ANSI color codes for different syntax elements
 # Standard ANSI colors: 30-37 (dark), 90-97 (bright)
 # Extended colors: 0-255 for terminals that support them
@@ -52,7 +60,7 @@ match_color=42
 # Light theme (uncomment to use)
 # fg_color=2E3440
 # bg_color=ECEFF4
-# High contrast theme (uncomment to use)
+# High contrast theme
 # fg_color=FFFFFF
 # bg_color=000000
 
