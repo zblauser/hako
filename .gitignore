@@ -4,7 +4,7 @@ __pycache__/
 *$py.class
 
 #version
-vcontrol/
+backup/
 
 # c ext
 *.so
