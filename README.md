@@ -9,7 +9,7 @@ A minimalistic modal text environment, containing your code without distraction.
 	<tr>
 		<td align="center">
 			<img src="./assets/hako-explorer.jpeg" alt="Explorer pane" width="200"/><br/>
-			[Explorer Pane]
+			[紙 Kami Explorer]
 		</td>
 		<td align="center">
 			<img src="./assets/hako-split.jpeg" alt="Split window system" width="200"/><br/>
@@ -23,20 +23,23 @@ A minimalistic modal text environment, containing your code without distraction.
 		</td>
 		<td align="center">
 			<img src="./assets/hako-ai.jpeg" alt="AI Integration" width="200"/><br/>
-		[AI Integration Coming]
+		[角 Kaku AI Assistant]
 		</td>
 	</tr>
 </table><br>
 
 - **Modal Editing**: Vi-inspired normal, insert, visual, and visual-line modes
 - **Multi-Pane Support**: Split windows horizontally and vertically
-- **File Explorer**: Built-in directory navigation with hidden file toggle
+- **File Explorer**: 紙 Kami — built-in directory navigation with hidden file toggle
+- **AI Assistant**: 角 Kaku — panel scaffolding for code assistance (integration coming)
 - **Syntax Highlighting**: Support for 40+ programming languages
 - **Undo/Redo**: Intelligent undo blocks with configurable history depth
 - **Visual Selection**: Character and line-based selection with yank/delete operations
+- **Clipboard**: Bracketed paste support, system clipboard integration (Ctrl-C/Ctrl-V)
 - **Fast Search**: Incremental search with next/previous navigation
-- **Line Numbers**: Absolute or relative numbering modes
-- **Customizable**: Configuration via `.hakorc` file
+- **Line Numbers**: Absolute or relative numbering, dynamic width
+- **Mouse Support**: Click to position, scroll wheel cursor movement
+- **Customizable**: Configuration via `.hakorc` file with theme presets
 
 ## Launch Hako
 Compile
@@ -68,23 +71,53 @@ cp hako /usr/local/bin/hako
 |Key      |Action                 |
 |---------|-----------------------|
 |`i`      |Enter insert mode      |
+|`I`      |Insert at first non-blank|
+|`a`      |Append after cursor    |
+|`A`      |Append at end of line  |
+|`o`      |Open line below        |
+|`O`      |Open line above        |
 |`v`      |Visual mode (character)|
 |`V`      |Visual mode (line)     |
 |`h,j,k,l`|Navigate (←↓↑→)        |
 |`w,b`    |Next/previous word     |
 |`0,$`    |Start/end of line      |
 |`gg,G`   |Top/bottom of file     |
-|`dd`     |Delete line            |
+|`dd`     |Delete line (yanks)    |
+|`D`      |Delete to end of line  |
+|`x`      |Delete character       |
+|`C`      |Change to end of line  |
 |`yy`     |Yank (copy) line       |
 |`p,P`    |Paste after/before     |
 |`u`      |Undo                   |
 |`Ctrl-R` |Redo                   |
+|`r`      |Replace character      |
+|`J`      |Join lines             |
 |`/`      |Search                 |
 |`n,N`    |Next/previous match    |
+|`Ctrl-C` |Copy to system clipboard|
+|`Ctrl-V` |Paste from system clipboard|
 |`:w`     |Save                   |
 |`:e [filename]`     |Open file   |
 |`:q`     |Quit                   |
 |`:wq`    |Save and quit          |
+|`Ctrl-F` |Page forward           |
+|`Ctrl-B` |Page backward          |
+
+### Visual Mode
+
+|Key       |Action                 |
+|----------|-----------------------|
+|`h,j,k,l` |Extend selection      |
+|`w,b`     |Word-wise selection    |
+|`0,$`     |Select to start/end   |
+|`gg,G`    |Select to top/bottom   |
+|`Ctrl-F`  |Page forward selection |
+|`Ctrl-B`  |Page backward selection|
+|`y`       |Yank selection         |
+|`d,x`     |Delete selection       |
+|`c`       |Change selection       |
+|`Ctrl-C`  |Copy to system clipboard|
+|`Esc`     |Exit visual mode       |
 
 ### Window Management
 
@@ -95,18 +128,46 @@ cp hako /usr/local/bin/hako
 |`Ctrl-W w`|Switch pane     |
 |`Ctrl-W c`|Close pane      |
 
-### File Explorer
+### File Explorer (紙 Kami)
 
 |Key        |Action             |
 |-----------|-------------------|
 |`:e,:explorer`|Toggle explorer |
 |`j,k`      |Navigate files     |
 |`h,l`      |Parent/open        |
+|`g,G`      |Top/bottom of list |
 |`.`        |Toggle hidden files|
+|`r`        |Refresh            |
+|`q,Esc`    |Close explorer     |
+
+### AI Assistant (角 Kaku)
+
+|Key        |Action             |
+|-----------|-------------------|
+|`:ai`      |Toggle AI panel    |
+|`i`        |Enter prompt mode  |
+|`v`        |Visual select      |
+|`j,k`      |Navigate history   |
+|`Esc`      |Back to normal     |
+|`:clear`   |Clear history      |
 
 ## Configuration
 
-Use supplied config, or HAKO will generate a `.hakorc` file in your home directory or project folder.
+Use supplied config, or generate one with `:config` inside the editor. HAKO looks for `.hakorc` in the current directory first, then your home directory.
+
+```
+# Example .hakorc
+tab_stop=4
+use_tabs=1
+show_line_numbers=2
+auto_indent=1
+smart_indent=1
+mouse_enabled=1
+theme=dark
+explorer_width=30
+```
+
+Run `:config` to generate a fully documented `.hakorc` with all options.
 
 ## Supported Languages
 
@@ -122,23 +183,48 @@ HAKO provides syntax color for 40+ languages, some of which include:
 
 ## Change Log
 
-### v0.0.7 (Latest)<br>
-Huge update to the previous version
-- New splash
-- Complete visual mode implementation (v/V)
-- Full copy/paste system with yank buffer
-- Additional vim motions (w/b, 0/$, r, J)
-- Screen splitting
-- Explorer panel
-- Enhanced help system
-- Improved terminal cleanup
-- Themes in .hakorc
-- Beginning of AI implementation (aesthetically, via ":ai" command)
-Hope I am not leaving anything out here, but this update is big enough I may be
+### v0.0.8 (Latest)<br>
+Major stability and usability update
+
+Features
+- Bracketed paste mode support — no more staircase indentation on paste
+- Rapid-input paste detection fallback for terminals without bracketed paste
+- System clipboard integration (Ctrl-C to copy, Ctrl-V to paste)
+- New vim motions: I, a, A, o, O (insert variants), x (delete char), D (delete to EOL), C (change to EOL)
+- Visual mode navigation: w/b, 0/$, gg/G, Ctrl-F/Ctrl-B for fast selection
+- dd now yanks the deleted line into the paste buffer (vim behavior)
+- Scroll wheel moves cursor naturally (like j/k) instead of jumping the viewport
+- Mouse click works in insert mode without producing artifacts
+- Dynamic line number width — scales for 10,000+ line files
+- Improved terminal type detection (Apple Terminal 256-color support)
+- Improved ANSI color fallback for basic terminals (visual selection visible everywhere)
+
+Bug Fixes
+- Fixed file save writing to wrong location when opened from a path
+- Fixed pane tree memory leaks on close and exit
+- Fixed right panel (AI) not being freed on cleanup
+- Reduced screen flicker via buffer optimization (geometric growth in append buffer)
+- Consistent naming across codebase (紙 Kami = explorer, 角 Kaku = AI)
+- Explicit smart_indent initialization
 
 ### Previous Versions
 <details>
 <summary>Previous Changes</summary>
+
+***v0.0.7***<br>
+Huge update to the previous version
+- New splash screen
+- Complete visual mode implementation (v/V)
+- Full copy/paste system with yank buffer
+- Additional vim motions (w/b, 0/$, r, J)
+- Screen splitting
+- 紙 Kami explorer panel
+- 角 Kaku AI assistant panel (scaffolding)
+- Enhanced help system
+- Improved terminal cleanup
+- Themes in .hakorc
+- Config generation via :config command
+- Mouse support with click-to-position and scroll wheel
 
 ***v0.0.6***<br>
 Features & Quality of Life
@@ -191,7 +277,7 @@ Bug Fixes
 </details>
 
 ## Roadmap
-- [ ] **v0.0.8**: Agnostic AI integration for code assistance, local LLM or major models via your API (grok, gpt, claude, ollama)
+- [ ] **v0.0.9**: Agnostic AI integration for code assistance, local LLM or major models via your API (grok, gpt, claude, ollama)
 
 ## Contributing
 If you share the belief that simplicity empowers creativity, feel free to contribute.

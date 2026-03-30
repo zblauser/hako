@@ -17,7 +17,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 */
 				
 /*** includes ***/
-#define HAKO_VERSION "0.0.7"
+#define HAKO_VERSION "0.0.8"
 
 #include <ctype.h>
 #include <errno.h>
@@ -40,7 +40,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 /*** defines ***/
 #define CTRL_KEY(k) ((k) & 0x1f)
-#define ABUF_INIT {NULL, 0}
+#define ABUF_INIT {NULL, 0, 0}
 #define HL_HIGHLIGHT_NUMBERS (1<<0)
 #define HL_HIGHLIGHT_STRINGS (1<<1)
 #define HLDB_ENTRIES (sizeof(HLDB) / sizeof(HLDB[0]))
@@ -61,6 +61,11 @@ const char *HAKO_HELP_TEXT =
 	"Commands:\n"
 	"  Normal Mode:\n"
 	"    i              Enter insert mode\n"
+	"    I              Insert at first non-blank\n"
+	"    a              Append after cursor\n"
+	"    A              Append at end of line\n"
+	"    o              Open line below\n"
+	"    O              Open line above\n"
 	"    v              Enter visual mode (character)\n"
 	"    V              Enter visual mode (line)\n"
 	"    h,j,k,l        Move cursor (or arrow keys)\n"
@@ -77,13 +82,16 @@ const char *HAKO_HELP_TEXT =
 	"    u              Undo\n"
 	"    Ctrl-R         Redo\n"
 	"    dd             Delete line\n"
+	"    D              Delete to end of line\n"
+	"    x              Delete character\n"
+	"    C              Change to end of line\n"
 	"    yy             Yank line\n"
 	"    p              Paste after\n"
 	"    P              Paste before\n"
 	"    r              Replace character\n"
 	"    J              Join lines\n"
-	"    tt             Jump to top\n"
-	"    bb             Jump to bottom\n"
+	"    gg             Jump to top\n"
+	"    G              Jump to bottom\n"
 	"    Ctrl-F         Page forward\n"
 	"    Ctrl-B         Page backward\n\n"
 	"  Visual Mode:\n"
@@ -189,6 +197,7 @@ typedef struct erow {
 struct abuf {
 	char *b;
 	int len;
+	int cap;
 };
 
 typedef struct {
@@ -486,6 +495,7 @@ void editorDrawStatusBar(struct abuf *ab);
 void editorDrawMessageBar(struct abuf *ab);
 void editorDrawSplash(void);
 void editorProcessKeyPress(void);
+int editorInputPending(void);
 void editorLoadConfig(void);
 void editorUpdateSyntax(erow *row);
 void editorSelectSyntaxHighlight(void);
@@ -1083,6 +1093,7 @@ void die(const char *s) {
 void disableRawMode() {
 	if (tcsetattr(STDIN_FILENO, TCSAFLUSH, &E.orig_termios) == -1) die("tcsetattr");
 	
+	write(STDOUT_FILENO, "\x1b[?2004l", 8);
 	write(STDOUT_FILENO, "\x1b[?1000l", 8);
 	write(STDOUT_FILENO, "\x1b[?1002l", 8);
 	write(STDOUT_FILENO, "\x1b[?1003l", 8);
@@ -1111,7 +1122,8 @@ void enableRawMode() {
 	write(STDOUT_FILENO, "\x1b[?1049h", 8);
 	write(STDOUT_FILENO, "\x1b[2J", 4);
 	write(STDOUT_FILENO, "\x1b[H", 3);
-	
+	write(STDOUT_FILENO, "\x1b[?2004h", 8);
+
 	if (E.mouse_enabled) {
 		write(STDOUT_FILENO, "\x1b[?1000h", 8);
 		write(STDOUT_FILENO, "\x1b[?1002h", 8);
@@ -1129,7 +1141,7 @@ void detectTerminalType() {
 	E.term_type = TERM_BASIC;
 	
 	if (term_program && strcmp(term_program, "Apple_Terminal") == 0) {
-		E.term_type = TERM_BASIC;
+		E.term_type = TERM_XTERM_256;
 		return;
 	}
 	
@@ -1166,10 +1178,16 @@ int getWindowSize(int *rows, int *cols) {
 
 /*** buffer ***/
 void abAppend(struct abuf *ab, const char *s, int len) {
-	char *new = realloc(ab->b, ab->len + len);
-	if (new == NULL) return;
-	memcpy(&new[ab->len], s, len);
-	ab->b = new;
+	int needed = ab->len + len;
+	if (needed > ab->cap) {
+		int newcap = ab->cap < 1024 ? 1024 : ab->cap;
+		while (newcap < needed) newcap *= 2;
+		char *new = realloc(ab->b, newcap);
+		if (new == NULL) return;
+		ab->b = new;
+		ab->cap = newcap;
+	}
+	memcpy(&ab->b[ab->len], s, len);
 	ab->len += len;
 }
 
@@ -1251,24 +1269,25 @@ void setThemeColor(struct abuf *ab, Color color) {
 		int color_index = 16 + (36 * (color.r * 5 / 255)) + (6 * (color.g * 5 / 255)) + (color.b * 5 / 255);
 		snprintf(buf, sizeof(buf), "\x1b[38;5;%dm", color_index);
 	} else {
-		int intensity = (color.r + color.g + color.b) / 3;
-		int ansi_color = 37;
-		
-		if (color.r > 180 && color.g < 100 && color.b < 100) ansi_color = 31;
-		else if (color.r < 100 && color.g > 180 && color.b < 100) ansi_color = 32;
-		else if (color.r > 180 && color.g > 180 && color.b < 100) ansi_color = 33;
-		else if (color.r < 100 && color.g < 100 && color.b > 180) ansi_color = 34;
-		else if (color.r > 180 && color.g < 100 && color.b > 180) ansi_color = 35;
-		else if (color.r < 100 && color.g > 180 && color.b > 180) ansi_color = 36;
-		else if (intensity > 200) ansi_color = 37;
-		else if (intensity < 50) ansi_color = 30;
-		else ansi_color = 37;
-		
-		if (intensity > 180 && ansi_color >= 30 && ansi_color <= 37) {
-			snprintf(buf, sizeof(buf), "\x1b[1;%dm", ansi_color);
-		} else {
-			snprintf(buf, sizeof(buf), "\x1b[%dm", ansi_color);
+		int ansi_color = 40;
+
+		if (color.r < 50 && color.g < 50 && color.b < 50) ansi_color = 40;
+		else if (color.r > 180 && color.g < 100 && color.b < 100) ansi_color = 41;
+		else if (color.r < 100 && color.g > 180 && color.b < 100) ansi_color = 42;
+		else if (color.r > 180 && color.g > 180 && color.b < 100) ansi_color = 43;
+		else if (color.r < 100 && color.g < 100 && color.b > 180) ansi_color = 44;
+		else if (color.r > 180 && color.g < 100 && color.b > 180) ansi_color = 45;
+		else if (color.r < 100 && color.g > 180 && color.b > 180) ansi_color = 46;
+		else if (color.r > 200 && color.g > 200 && color.b > 200) ansi_color = 47;
+		else {
+			int intensity = (color.r + color.g + color.b) / 3;
+			if (intensity > 127) ansi_color = 47;
+			else if (color.b > color.r && color.b > color.g) ansi_color = 44;
+			else if (color.g > color.r) ansi_color = 42;
+			else if (color.r > color.g) ansi_color = 41;
 		}
+
+		snprintf(buf, sizeof(buf), "\x1b[%dm", ansi_color);
 	}
 	abAppend(ab, buf, strlen(buf));
 }
@@ -1520,6 +1539,13 @@ editorPane *editorCreatePane(enum paneType type, int x, int y, int width, int he
 void editorFreePane(editorPane *pane) {
 	if (!pane) return;
 
+	if (pane->split_dir != SPLIT_NONE) {
+		editorFreePane(pane->child1);
+		editorFreePane(pane->child2);
+		free(pane);
+		return;
+	}
+
 	if (pane->type == PANE_EDITOR) {
 		for (int i = 0; i < pane->numrows; i++) {
 			editorFreeRow(&pane->row[i]);
@@ -1724,8 +1750,11 @@ void editorClosePane() {
 	
 	editorUpdatePaneBounds(sibling->parent ? sibling->parent : sibling);
 	
+	parent->child1 = NULL;
+	parent->child2 = NULL;
+	parent->split_dir = SPLIT_NONE;
 	editorFreePane(pane);
-	editorFreePane(parent);
+	free(parent);
 	
 	E.active_pane = sibling;
 	E.num_panes--;
@@ -3032,9 +3061,9 @@ void editorOpen(char *filename) {
 
 	free(pane->filename);
 	
-	char *basename = strrchr(filename, '/');
-	if (basename) {
-		pane->filename = strdup(basename + 1);
+	char resolved[PATH_MAX];
+	if (realpath(filename, resolved)) {
+		pane->filename = strdup(resolved);
 	} else {
 		pane->filename = strdup(filename);
 	}
@@ -3180,15 +3209,17 @@ void editorDrawPane(editorPane *pane, struct abuf *ab) {
 			
 			if (E.show_line_numbers) {
 				if (wrap_line == 0) {
-					char line_num[8];
+					char line_num[16];
 					int number = E.show_line_numbers == 2 && filerow != pane->cy ? 
 								abs(filerow - pane->cy) : filerow + 1;
-					snprintf(line_num, sizeof(line_num), "%3d ", number);
+					int w = E.line_number_width - 1;
+					snprintf(line_num, sizeof(line_num), "%*d ", w, number);
 					setThemeColor(ab, E.theme.line_number);
-					abAppend(ab, line_num, 4);
+					abAppend(ab, line_num, E.line_number_width);
 				} else {
 					setThemeColor(ab, E.theme.line_number);
-					abAppend(ab, "    ", 4);
+					for (int p = 0; p < E.line_number_width; p++)
+						abAppend(ab, " ", 1);
 				}
 			}
 			
@@ -3245,7 +3276,7 @@ void editorDrawPane(editorPane *pane, struct abuf *ab) {
 			}
 			
 			setThemeBgColor(ab, E.theme.bg);
-			for (int x = drawn + (E.show_line_numbers ? 4 : 0); x < pane->width; x++) {
+			for (int x = drawn + (E.show_line_numbers ? E.line_number_width : 0); x < pane->width; x++) {
 				abAppend(ab, " ", 1);
 			}
 		} else {
@@ -3253,13 +3284,15 @@ void editorDrawPane(editorPane *pane, struct abuf *ab) {
 			
 			if (E.show_line_numbers) {
 				setThemeColor(ab, E.theme.line_number);
-				abAppend(ab, "  ~ ", 4);
+				for (int p = 0; p < E.line_number_width - 2; p++)
+					abAppend(ab, " ", 1);
+				abAppend(ab, "~ ", 2);
 			} else {
 				setThemeColor(ab, E.theme.line_number);
 				abAppend(ab, "~", 1);
 			}
 
-			for (int i = E.show_line_numbers ? 4 : 1; i < pane->width; i++) {
+			for (int i = E.show_line_numbers ? E.line_number_width : 1; i < pane->width; i++) {
 				abAppend(ab, " ", 1);
 			}
 		}
@@ -3498,55 +3531,20 @@ void editorProcessMouse(int button, int x, int y) {
 void editorHandleScroll(int direction) {
 	editorPane *pane = E.active_pane;
 	if (!pane || pane->type != PANE_EDITOR) return;
-	
+
 	int amount = E.scroll_speed ? E.scroll_speed : 3;
-	
-	if (E.word_wrap && pane->wrap_lines) {
-		int wrap_width = pane->width - E.line_number_width;
-		if (wrap_width < 1) wrap_width = 1;
-		
-		if (direction == MOUSE_WHEEL_UP) {
-			pane->rowoff = MAX(0, pane->rowoff - amount);
-		} else if (direction == MOUSE_WHEEL_DOWN) {
-			int visual_rows = 0;
-			for (int i = 0; i < pane->numrows; i++) {
-				int lines = (pane->row[i].rsize + wrap_width - 1) / wrap_width;
-				if (lines < 1) lines = 1;
-				visual_rows += lines;
-			}
-			int max_offset = MAX(0, visual_rows - pane->height);
-			pane->rowoff = MIN(max_offset, pane->rowoff + amount);
-		}
-		
-		int current_visual = 0;
-		for (int i = 0; i < pane->numrows; i++) {
-			int lines = (pane->row[i].rsize + wrap_width - 1) / wrap_width;
-			if (lines < 1) lines = 1;
-			if (current_visual + lines > pane->rowoff) {
-				if (direction == MOUSE_WHEEL_UP && pane->cy > i) {
-					pane->cy = i;
-					pane->cx = 0;
-				} else if (direction == MOUSE_WHEEL_DOWN && pane->cy < i) {
-					pane->cy = i;
-					pane->cx = 0;
-				}
-				break;
-			}
-			current_visual += lines;
-		}
-	} else {
-		if (direction == MOUSE_WHEEL_UP) {
-			pane->rowoff = MAX(0, pane->rowoff - amount);
-			if (pane->cy >= pane->rowoff + pane->height) {
-				pane->cy = pane->rowoff + pane->height - 1;
-			}
-		} else if (direction == MOUSE_WHEEL_DOWN) {
-			int max_offset = MAX(0, pane->numrows - pane->height);
-			pane->rowoff = MIN(max_offset, pane->rowoff + amount);
-			if (pane->cy < pane->rowoff) {
-				pane->cy = pane->rowoff;
-			}
-		}
+
+	if (direction == MOUSE_WHEEL_UP) {
+		for (int i = 0; i < amount && pane->cy > 0; i++)
+			pane->cy--;
+	} else if (direction == MOUSE_WHEEL_DOWN) {
+		for (int i = 0; i < amount && pane->cy < pane->numrows - 1; i++)
+			pane->cy++;
+	}
+
+	if (pane->cy < pane->numrows) {
+		int rowlen = pane->row[pane->cy].size;
+		if (pane->cx > rowlen) pane->cx = rowlen;
 	}
 }
 
@@ -3675,13 +3673,6 @@ void editorColonCommand() {
 
 /*** main drawing functions ***/
 void editorDrawRows(struct abuf *ab) {
-	setThemeBgColor(ab, E.theme.bg);
-	char clearbuf[32];
-	for (int y = 0; y < E.screenrows + 2; y++) {
-		snprintf(clearbuf, sizeof(clearbuf), "\x1b[%d;1H\x1b[K", y + 1);
-		abAppend(ab, clearbuf, strlen(clearbuf));
-	}
-
 	if (E.left_panel) {
 		editorDrawPane(E.left_panel, ab);
 		
@@ -3719,8 +3710,13 @@ void editorDrawStatusBar(struct abuf *ab) {
 	char status[80], rstatus[80];
 
 	if (pane && pane->type == PANE_EDITOR) {
+		const char *display_name = pane->filename;
+		if (display_name) {
+			const char *slash = strrchr(display_name, '/');
+			if (slash) display_name = slash + 1;
+		}
 		int len = snprintf(status, sizeof(status), " %.20s %s",
-			pane->filename ? pane->filename : "[No Name]", 
+			display_name ? display_name : "[No Name]", 
 			pane->dirty ? "[+]" : "");
 		int rlen = snprintf(rstatus, sizeof(rstatus), "%s | %d:%d ",
 			pane->syntax ? pane->syntax->filetype : "text", 
@@ -3739,7 +3735,8 @@ void editorDrawStatusBar(struct abuf *ab) {
 		}
 	} else if (pane && pane->type == PANE_EXPLORER) {
 		explorerData *data = pane->explorer;
-		int len = snprintf(status, sizeof(status), " 森 Mori: %.60s",
+		int len = snprintf(status, sizeof(status), " %s %s: %.60s",
+			E.explorer_kanji, E.explorer_name,
 			data && data->current_dir ? data->current_dir : "/");
 		
 		int selected_info_len = 0;
@@ -3761,7 +3758,8 @@ void editorDrawStatusBar(struct abuf *ab) {
 		}
 	} else if (pane && pane->type == PANE_AI) {
 		aiData *data = pane->ai;
-		int len = snprintf(status, sizeof(status), " 角 Kaku: %s", 
+		int len = snprintf(status, sizeof(status), " %s %s: %s",
+			E.ai_kanji, E.ai_name,
 			data && data->mode == MODE_INSERT ? "Listening..." : "Ready");
 		
 		int history_info_len = 0;
@@ -3837,7 +3835,13 @@ void editorRefreshScreen() {
 	editorUpdateWindowSize();
 
 	if (E.show_line_numbers) {
-		E.line_number_width = 4;
+		editorPane *ap = E.active_pane;
+		int max_line = (ap && ap->type == PANE_EDITOR) ? ap->numrows : 0;
+		if (max_line < 1) max_line = 1;
+		E.line_number_width = 2;
+		int n = max_line;
+		while (n >= 10) { E.line_number_width++; n /= 10; }
+		if (E.line_number_width < 4) E.line_number_width = 4;
 	} else {
 		E.line_number_width = 0;
 	}
@@ -3897,6 +3901,14 @@ void editorRefreshScreen() {
 }
 
 /*** input processing ***/
+int editorInputPending() {
+	fd_set fds;
+	struct timeval tv = {0, 0};
+	FD_ZERO(&fds);
+	FD_SET(STDIN_FILENO, &fds);
+	return select(STDIN_FILENO + 1, &fds, NULL, NULL, &tv) > 0;
+}
+
 void editorProcessKeyPress() {
 	static int last_char = 0;
 	static int g_pressed = 0;
@@ -3928,10 +3940,11 @@ void editorProcessKeyPress() {
 
 	if (c == MOUSE_CLICK) {
 		editorProcessMouse(0, E.mouse_x, E.mouse_y);
+		if (E.mode == MODE_INSERT) editorSetMode(MODE_INSERT);
 		return;
 	}
 
-	if (c == MOUSE_MOTION) {
+	if (c == MOUSE_MOTION || c == 0) {
 		return;
 	}
 
@@ -3987,6 +4000,94 @@ void editorProcessKeyPress() {
 		case 'i':
 			editorSetMode(MODE_INSERT);
 			editorSaveState();
+			break;
+
+		case 'I':
+			pane->cx = 0;
+			if (pane->cy < pane->numrows) {
+				erow *row = &pane->row[pane->cy];
+				while (pane->cx < row->size && isspace(row->chars[pane->cx]))
+					pane->cx++;
+			}
+			editorSetMode(MODE_INSERT);
+			editorSaveState();
+			break;
+
+		case 'a':
+			if (pane->cy < pane->numrows && pane->cx < pane->row[pane->cy].size) {
+				pane->cx = utf8_next_char(pane->row[pane->cy].chars, pane->cx, pane->row[pane->cy].size);
+			}
+			editorSetMode(MODE_INSERT);
+			editorSaveState();
+			break;
+
+		case 'A':
+			if (pane->cy < pane->numrows) {
+				pane->cx = pane->row[pane->cy].size;
+			}
+			editorSetMode(MODE_INSERT);
+			editorSaveState();
+			break;
+
+		case 'o':
+			if (pane->cy < pane->numrows) {
+				pane->cx = pane->row[pane->cy].size;
+			}
+			editorSaveState();
+			editorInsertNewLine();
+			editorSetMode(MODE_INSERT);
+			break;
+
+		case 'O':
+			pane->cx = 0;
+			editorSaveState();
+			editorInsertRow(pane->cy, "", 0);
+			editorSetMode(MODE_INSERT);
+			break;
+
+		case 'x':
+			if (pane->cy < pane->numrows && pane->cx < pane->row[pane->cy].size) {
+				editorSaveState();
+				char ch = pane->row[pane->cy].chars[pane->cx];
+				editorSetPasteBuffer(&ch, 1, 0);
+				editorRowDelChar(&pane->row[pane->cy], pane->cx);
+				if (pane->cx >= pane->row[pane->cy].size && pane->cx > 0) {
+					pane->cx--;
+				}
+			}
+			last_char = 0;
+			g_pressed = 0;
+			break;
+
+		case 'D':
+			if (pane->cy < pane->numrows) {
+				editorSaveState();
+				erow *row = &pane->row[pane->cy];
+				if (pane->cx < row->size) {
+					editorSetPasteBuffer(&row->chars[pane->cx], row->size - pane->cx, 0);
+					row->size = pane->cx;
+					row->chars[row->size] = '\0';
+					editorUpdateRow(row);
+					pane->dirty++;
+				}
+			}
+			last_char = 0;
+			g_pressed = 0;
+			break;
+
+		case 'C':
+			if (pane->cy < pane->numrows) {
+				editorSaveState();
+				erow *row = &pane->row[pane->cy];
+				if (pane->cx < row->size) {
+					editorSetPasteBuffer(&row->chars[pane->cx], row->size - pane->cx, 0);
+					row->size = pane->cx;
+					row->chars[row->size] = '\0';
+					editorUpdateRow(row);
+					pane->dirty++;
+				}
+			}
+			editorSetMode(MODE_INSERT);
 			break;
 
 		case 'V':
@@ -4246,6 +4347,17 @@ void editorProcessKeyPress() {
 		case 'd':
 			if (last_char == 'd') {
 				editorSaveState();
+
+				if (pane->cy < pane->numrows) {
+					erow *row = &pane->row[pane->cy];
+					char *line = malloc(row->size + 2);
+					memcpy(line, row->chars, row->size);
+					line[row->size] = '\n';
+					line[row->size + 1] = '\0';
+					editorSetPasteBuffer(line, row->size + 1, 1);
+					free(line);
+				}
+
 				editorDelRow(pane->cy);
 
 				if (pane->numrows == 0) {
@@ -4346,7 +4458,18 @@ void editorProcessKeyPress() {
 		time_t now = time(NULL);
 		
 		if (now - last_undo_time > 2) should_save = 1;
-		
+
+		if (!E.is_pasting && editorInputPending()) {
+			E.is_pasting = 1;
+			editorSaveState();
+			last_undo_time = now;
+			should_save = 0;
+		}
+
+		if (E.is_pasting && !editorInputPending()) {
+			E.is_pasting = 0;
+		}
+
 		switch (c) {
 		case '\r':
 			if (last_action != c) should_save = 1;
@@ -4412,11 +4535,81 @@ void editorProcessKeyPress() {
 			break;
 
 		case 'h':
-		case 'l':
 		case ARROW_LEFT:
+			if (E.mode == MODE_VISUAL) {
+				editorMoveCursor(c);
+			}
+			break;
+
+		case 'l':
 		case ARROW_RIGHT:
 			if (E.mode == MODE_VISUAL) {
 				editorMoveCursor(c);
+			}
+			break;
+
+		case 'w':
+			if (pane->cy < pane->numrows) {
+				erow *row = &pane->row[pane->cy];
+				while (pane->cx < row->size && !is_separator(row->chars[pane->cx])) pane->cx++;
+				while (pane->cx < row->size && is_separator(row->chars[pane->cx])) pane->cx++;
+				if (pane->cx >= row->size && pane->cy < pane->numrows - 1) {
+					pane->cy++;
+					pane->cx = 0;
+				}
+			}
+			break;
+
+		case 'b':
+			if (pane->cx > 0 || pane->cy > 0) {
+				if (pane->cx == 0 && pane->cy > 0) {
+					pane->cy--;
+					pane->cx = pane->row[pane->cy].size;
+				} else {
+					erow *row = &pane->row[pane->cy];
+					while (pane->cx > 0 && is_separator(row->chars[pane->cx - 1])) pane->cx--;
+					while (pane->cx > 0 && !is_separator(row->chars[pane->cx - 1])) pane->cx--;
+				}
+			}
+			break;
+
+		case 'G':
+			pane->cy = pane->numrows > 0 ? pane->numrows - 1 : 0;
+			if (pane->cy < pane->numrows)
+				pane->cx = pane->row[pane->cy].size;
+			break;
+
+		case 'g':
+			pane->cy = 0;
+			pane->cx = 0;
+			break;
+
+		case '0':
+			pane->cx = 0;
+			break;
+
+		case '$':
+			if (pane->cy < pane->numrows)
+				pane->cx = pane->row[pane->cy].size;
+			break;
+
+		case CTRL_KEY('f'):
+		case PAGE_DOWN:
+			{
+				int times = pane->height;
+				while (times-- && pane->cy < pane->numrows - 1) {
+					pane->cy++;
+				}
+			}
+			break;
+
+		case CTRL_KEY('b'):
+		case PAGE_UP:
+			{
+				int times = pane->height;
+				while (times-- && pane->cy > 0) {
+					pane->cy--;
+				}
 			}
 			break;
 
@@ -5617,11 +5810,12 @@ void initEditor() {
 	E.plugin_count = 0;
 	E.plugin_dir = NULL;
 	E.auto_indent = 1;
+	E.smart_indent = 1;
 
 	E.explorer_kanji = strdup("紙");
 	E.explorer_name = strdup("Kami");
-	E.ai_kanji = strdup("筆");
-	E.ai_name = strdup("Fude");
+	E.ai_kanji = strdup("角");
+	E.ai_name = strdup("Kaku");
 
 	E.indent_guides = 0;
 	E.scroll_speed = 3;
@@ -5662,6 +5856,9 @@ void editorCleanup() {
 	}
 	if (E.left_panel) {
 		editorFreePane(E.left_panel);
+	}
+	if (E.right_panel) {
+		editorFreePane(E.right_panel);
 	}
 
 	editorFreePasteBuffer();
