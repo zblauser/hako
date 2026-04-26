@@ -23,23 +23,26 @@ A minimalistic modal text environment, containing your code without distraction.
 		</td>
 		<td align="center">
 			<img src="./assets/hako-ai.jpeg" alt="AI Integration" width="200"/><br/>
-		[角 Kaku AI Assistant]
+		[零 Rei AI Assistant]
 		</td>
 	</tr>
 </table><br>
 
-- **Modal Editing**: Vi-inspired normal, insert, visual, and visual-line modes
-- **Multi-Pane Support**: Split windows horizontally and vertically
-- **File Explorer**: 紙 Kami — built-in directory navigation with hidden file toggle
-- **AI Assistant**: 角 Kaku — panel scaffolding for code assistance (integration coming)
-- **Syntax Highlighting**: Support for 40+ programming languages
-- **Undo/Redo**: Intelligent undo blocks with configurable history depth
-- **Visual Selection**: Character and line-based selection with yank/delete operations
-- **Clipboard**: Bracketed paste support, system clipboard integration (Ctrl-C/Ctrl-V)
-- **Fast Search**: Incremental search with next/previous navigation
-- **Line Numbers**: Absolute or relative numbering, dynamic width
-- **Mouse Support**: Click to position, scroll wheel cursor movement
-- **Customizable**: Configuration via `.hakorc` file with theme presets
+- **Modal Editing**: Vim-inspired normal, insert, visual, and visual-line modes
+- **Full Motion Set**: counts, named registers, text objects (`diw`, `ci"`, `da(`), marks, jumplist, dot-repeat, `:s/` substitution, bracket match
+- **Multi-Pane Support**: Split horizontally and vertically, resize with `Ctrl-W +/-/</>`
+- **File Explorer**: 紙 Kami — directory navigation, hidden-file toggle, dirs-first sort
+- **AI Assistant**: 零 Rei — multi-provider (Anthropic, OpenAI, Ollama), function-calling tool loop, SSE streaming, per-project trust and history
+- **Skills**: drop `~/.hako/skills/*.md` into the system prompt, install from any URL with `/skill install`
+- **Syntax Highlighting**: 40+ languages, search-match highlighting persists across edits
+- **Undo/Redo**: time-bounded undo blocks, configurable depth
+- **Visual Selection**: character and line modes with yank/delete/change, count feedback
+- **Clipboard**: bracketed paste, system clipboard via `Ctrl-C`/`Ctrl-V`
+- **Fast Search**: incremental with `n`/`N`, all matches highlighted
+- **Line Numbers**: absolute or relative, dynamic width
+- **Mouse Support**: click to position, scroll wheel moves cursor
+- **17 Themes**: dark, light, gruvbox, nord, dracula, monokai, solarized, tokyonight, catppuccin, onedark, material, everforest, rosepine, github-dark, github-light, ayu, kanagawa
+- **Customizable**: every setting in `.hakorc`, model/provider choices persist in `~/.hako/state`
 
 ## Launch Hako
 Compile
@@ -140,16 +143,37 @@ cp hako /usr/local/bin/hako
 |`r`        |Refresh            |
 |`q,Esc`    |Close explorer     |
 
-### AI Assistant (角 Kaku)
+### AI Assistant (零 Rei)
 
-|Key        |Action             |
-|-----------|-------------------|
-|`:ai`      |Toggle AI panel    |
-|`i`        |Enter prompt mode  |
-|`v`        |Visual select      |
-|`j,k`      |Navigate history   |
-|`Esc`      |Back to normal     |
-|`:clear`   |Clear history      |
+|Key        |Action                              |
+|-----------|------------------------------------|
+|`:ai`      |Toggle AI panel                     |
+|`i`        |Enter prompt mode                   |
+|`Enter`    |In INSERT: newline. In NORMAL: send |
+|`Esc`      |Back to NORMAL                      |
+|`v`        |Visual select (copy-only in history)|
+|`j,k`      |Navigate history                    |
+|`Ctrl-W w` |Switch pane                         |
+|`Ctrl-C`   |Close panel                         |
+|`:q`       |Close panel                         |
+
+**Slash commands** (type inside the prompt):
+
+|Command                 |Action                                       |
+|------------------------|---------------------------------------------|
+|`/help`                 |List commands                                |
+|`/provider <name>`      |ollama, anthropic, openai                    |
+|`/model <id>`           |Switch model (persists to `~/.hako/state`)   |
+|`/tools on|off`         |Toggle function calling                      |
+|`/trust` / `/trust revoke` | Grant or revoke file-ops in this project  |
+|`/skills [reload]`      |List / reload `~/.hako/skills/*.md`          |
+|`/skill install <url>`  |Download a skill into `~/.hako/skills/`      |
+|`/history [local|global]`|Show path, or move to `<cwd>/.hako/history` |
+|`/file <path>`          |Inject a local file into context             |
+|`/clear`                |Wipe visible history                         |
+|`/quit`                 |Close the panel                              |
+
+**Tools** (when trusted): `read_file`, `list_dir`, `write_file` (path constrained to project), `run_shell` (10s timeout).
 
 ## Configuration
 
@@ -183,9 +207,48 @@ HAKO provides syntax color for 40+ languages, some of which include:
 
 ## Change Log
 
-### v0.0.8 (Latest)<br>
-Major stability and usability update
+### v0.0.9 (Latest)<br>
+Big one. HAKO goes from editor-with-AI-panel to modal editing environment with a real agent inside.
 
+Editor
+- Full vim-motion set: count prefix (`5j`, `3dd`), named registers (`"ayy`, `"ap`), text objects (`diw`, `ci"`, `da(`), marks (`ma`, `'a`), jumplist (`Ctrl-O` / `Tab`), dot-repeat (`.`), substitution (`:s/foo/bar/g`), bracket match (`%`), word-under-cursor search (`*`, `#`)
+- Search highlighting persists across edits, all matches lit (not just current)
+- Line-delete feedback in status (`N lines deleted`)
+- `:e` expands `~/`, resolves relative and absolute paths so `:w` saves where you meant
+- `:q` closes the active pane, not the whole program
+- `dw`, `cw`, `:w file.txt` confirmed working
+- 17 theme presets (dark, light, gruvbox, nord, dracula, monokai, solarized, tokyonight, catppuccin, onedark, material, everforest, rosepine, github-dark, github-light, ayu, kanagawa)
+- Responsive layout — side panels auto-collapse on narrow terminals
+- Explorer entries always sorted: directories first, then files, case-insensitive
+- Status bar now uses the border color so panels feel like one chassis
+
+Rei  — 零
+- Multi-provider: Anthropic, OpenAI, Ollama (swap with `/provider`)
+- Function-calling tool loop (Anthropic): `read_file`, `list_dir`, `write_file`, `run_shell`
+- SSE streaming for text responses
+- Project trust: first `:ai` asks before enabling file tools in a directory; grants stored in `<project>/.hako/trust`
+- Per-project chat history in `<project>/.hako/history` when trusted, falls back to `~/.hako/history`
+- Skills loader: `~/.hako/skills/*.md` injected into system prompt; `/skill install <url>` downloads a skill
+- Multi-line input: Enter inserts newline in INSERT, sends in NORMAL. Input bar wraps and stays visible
+- Slash commands: `/help`, `/provider`, `/model`, `/tools`, `/trust`, `/skills`, `/skill install`, `/history`, `/file`, `/clear`, `/quit`
+- Model + provider choice persists across restarts (`~/.hako/state`)
+- Configurable mascot (`ai_mascot=path/to/art.txt`), lucky-cat default
+
+Fixes
+- Pane focus no longer dangles when a side panel is closed from inside it
+- Ctrl-W back from Rei does not lock the terminal
+- Inline prompt reads (`"a`, `di"`, `ma`, `r`) skip mouse-motion events instead of consuming them as the expected letter
+- Splash logo + status bar now theme-aware (match border color)
+- Cursor lands in the selected explorer entry and in the Rei input bar instead of the status line
+- Window-size changes resize panes immediately instead of drifting until the next SIGWINCH
+
+
+### Previous Versions
+<details>
+<summary>Previous Changes</summary>
+
+***v0.0.8***<br>
+Major stability and usability update
 Features
 - Bracketed paste mode support — no more staircase indentation on paste
 - Rapid-input paste detection fallback for terminals without bracketed paste
@@ -207,9 +270,6 @@ Bug Fixes
 - Consistent naming across codebase (紙 Kami = explorer, 角 Kaku = AI)
 - Explicit smart_indent initialization
 
-### Previous Versions
-<details>
-<summary>Previous Changes</summary>
 
 ***v0.0.7***<br>
 Huge update to the previous version
@@ -277,7 +337,12 @@ Bug Fixes
 </details>
 
 ## Roadmap
-- [ ] **v0.0.9**: Agnostic AI integration for code assistance, local LLM or major models via your API (grok, gpt, claude, ollama)
+- [ ] Windows parity
+- [ ] Diff-render (fewer redraws)
+- [ ] In-editor slash menus for themes and settings
+- [ ] Write-file diff preview with confirm
+- [ ] OpenAI/Ollama tool parity
+- [ ] Buffer list (`:ls`, `:b`)
 
 ## Contributing
 If you share the belief that simplicity empowers creativity, feel free to contribute.
