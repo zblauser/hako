@@ -1,7 +1,7 @@
 <p align="center">
   <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/hakocorp/hakocorp.github.io/1a50032f519ae4df58aed8394859084d39206955/assets/banner-dark.svg$0">
-    <img src="https://raw.githubusercontent.com/hakocorp/hakocorp.github.io/1a50032f519ae4df58aed8394859084d39206955/assets/banner-light.svg$0" alt="HAKO" width="100%"/>
+    <source media="(prefers-color-scheme: dark)" srcset="https://github.com/hakocorp/hakocorp.github.io/blob/main/assets/banner-dark.gif?raw=true$0">
+    <img src="https://github.com/hakocorp/hakocorp.github.io/blob/main/assets/banner-light.gif?raw=true$0" alt="HAKO" width="100%"/>
   </picture>
 </p>
 
@@ -39,7 +39,6 @@
 <br>
 
 零 **Rei** lives inside Hako — your in-editor AI assistant, drawn as a little squid:
-
 ```
             ███
           ███████         ----------
@@ -48,7 +47,7 @@
       ███████████████     Model: You Choose
       █ ███████████ █     ----------
         ███████████
-        █ █ █ █ █ █
+	    █  █   █  █
 ```
 
 ## Overview
