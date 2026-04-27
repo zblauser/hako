@@ -92,7 +92,7 @@ ai_mascot=
 #        tokyonight, catppuccin, onedark, material,
 #        everforest, rosepine, github-dark, ayu, kanagawa
 # Light: light, github-light
-theme=dark
+theme=gruvbox
 
 # ============================================================
 #  Custom colors (RGB 0-255). Override preset values.

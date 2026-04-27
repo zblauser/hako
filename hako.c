@@ -17,7 +17,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 */
 				
 /*** includes ***/
-#define HAKO_VERSION "0.0.9"
+#define HAKO_VERSION "0.0.95"
 
 #include <ctype.h>
 #include <errno.h>
@@ -1408,7 +1408,6 @@ int utf8_char_width(const char *s, int pos) {
 	if (len == 3) {
 		if (c == 0xE2) {
 			unsigned char c1 = s[pos + 1];
-			unsigned char c2 = s[pos + 2];
 			if ((c1 >= 0x94 && c1 <= 0x96) || (c1 >= 0x98 && c1 <= 0x9F)) {
 				return 1;
 			}
@@ -1434,6 +1433,42 @@ int utf8_prev_char(const char *s, int pos) {
 	pos--;
 	while (pos > 0 && (s[pos] & 0xC0) == 0x80) pos--;
 	return pos;
+}
+
+static int utf8_display_width(const char *s) {
+	if (!s) return 0;
+	int col = 0;
+	int i = 0;
+	int n = (int)strlen(s);
+	while (i < n) {
+		col += utf8_char_width(s, i);
+		i = utf8_next_char(s, i, n);
+	}
+	return col;
+}
+
+/* Return byte offset+length covering display cols [start_col, start_col+max_cols).
+ * Also returns the actual display-cell count of the slice in *out_cols. */
+static void utf8_slice(const char *s, int start_col, int max_cols,
+                       int *out_off, int *out_len, int *out_cols) {
+	int col = 0, i = 0, n = s ? (int)strlen(s) : 0;
+	int off = n, end = n, cols = 0;
+	int found = 0;
+	while (i < n) {
+		int w = utf8_char_width(s, i);
+		if (!found && col >= start_col) { off = i; found = 1; }
+		if (found) {
+			if (cols + w > max_cols) break;
+			cols += w;
+		}
+		col += w;
+		i = utf8_next_char(s, i, n);
+		if (found) end = i;
+	}
+	if (!found) { off = n; end = n; }
+	if (out_off)  *out_off  = off;
+	if (out_len)  *out_len  = end - off;
+	if (out_cols) *out_cols = cols;
 }
 
 /*** color ***/
@@ -6314,9 +6349,14 @@ void aiInit(editorPane *pane) {
 	pthread_mutex_init(&data->lock, NULL);
 	
 	const char *default_mascot[] = {
-		" ^   ^ ",
-		"(o) (o)",
-		"  \\_/  ",
+		"      ███",
+		"    ███████",
+		"   █████████",
+		"  ██ █████ ██",
+		"███████████████",
+		"█ ███████████ █",
+		"  ███████████",
+		"  █  █   █  █",
 		NULL
 	};
 
@@ -6801,8 +6841,10 @@ void aiRender(editorPane *pane, struct abuf *ab) {
 	int *line_sub = NULL;
 	int owner_cap = 0;
 	for (int i = 0; i < data->history_count; i++) {
-		int tl = data->history[i] ? strlen(data->history[i]) : 0;
-		int rows = tl > 0 ? (tl + inner_w - 3) / (inner_w - 2) : 1;
+		int seg_cols_w = inner_w - 2;
+		if (seg_cols_w < 1) seg_cols_w = 1;
+		int dw = utf8_display_width(data->history[i]);
+		int rows = dw > 0 ? (dw + seg_cols_w - 1) / seg_cols_w : 1;
 		if (rows < 1) rows = 1;
 		for (int s = 0; s < rows; s++) {
 			if (total_vis >= owner_cap) {
@@ -6882,11 +6924,9 @@ void aiRender(editorPane *pane, struct abuf *ab) {
 				int msg_idx = line_owner[vrow];
 				int sub = line_sub[vrow];
 				char *text = data->history[msg_idx];
-				int tlen = text ? strlen(text) : 0;
 				int seg_w = inner_w - 2;
-				int off = sub * seg_w;
-				int seg_len = MIN(seg_w, tlen - off);
-				if (seg_len < 0) seg_len = 0;
+				int byte_off = 0, seg_len = 0, seg_cols = 0;
+				utf8_slice(text, sub * seg_w, seg_w, &byte_off, &seg_len, &seg_cols);
 
 				int is_selected = (data->visual_mode &&
 					msg_idx >= MIN(data->visual_start, data->visual_end) &&
@@ -6901,9 +6941,9 @@ void aiRender(editorPane *pane, struct abuf *ab) {
 				if (sub == 0) abAppend(ab, msg_idx % 2 == 0 ? "> " : "  ", 2);
 				else abAppend(ab, "  ", 2);
 
-				if (seg_len > 0) abAppend(ab, text + off, seg_len);
+				if (seg_len > 0) abAppend(ab, text + byte_off, seg_len);
 				setThemeBgColor(ab, E.theme.bg);
-				for (int x = seg_len + 2; x < inner_w; x++) abAppend(ab, " ", 1);
+				for (int x = seg_cols + 2; x < inner_w; x++) abAppend(ab, " ", 1);
 			} else {
 				for (int x = 0; x < inner_w; x++) abAppend(ab, " ", 1);
 			}

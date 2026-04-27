@@ -1,32 +1,57 @@
-# 箱 HAKO
-## Overview
-A minimalistic modal text environment, containing your code without distraction.<br>
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="https://hakocorp.github.io/assets/banner-dark.svg">
+    <img src="https://hakocorp.github.io/assets/banner-light.svg" alt="HAKO" width="100%"/>
+  </picture>
+</p>
 
 <p align="center">
-	<img src="./assets/hako-logo.jpeg" alt="Hako logo" width="200" /><br>
-</p><br>
+  <em>A minimalistic modal text environment, containing your code without distraction.</em>
+</p>
+
+<p align="center">
+  <img src="https://hakocorp.github.io/assets/screenshot-splash.png" alt="Splash" width="80%"/>
+</p>
+
 <table align="center">
-	<tr>
-		<td align="center">
-			<img src="./assets/hako-explorer.jpeg" alt="Explorer pane" width="200"/><br/>
-			[紙 Kami Explorer]
-		</td>
-		<td align="center">
-			<img src="./assets/hako-split.jpeg" alt="Split window system" width="200"/><br/>
-			[Split Window Panes]
-		</td>
-	</tr>
-	<tr>
-		<td align="center">
-			<img src="./assets/hako-search.jpeg" alt="Help system" width="200"/><br/>
-			[Search/Replace]
-		</td>
-		<td align="center">
-			<img src="./assets/hako-ai.jpeg" alt="AI Integration" width="200"/><br/>
-		[零 Rei AI Assistant]
-		</td>
-	</tr>
-</table><br>
+  <tr>
+    <td align="center" width="50%">
+      <img src="https://hakocorp.github.io/assets/screenshot-explorer.png" alt="Kami explorer" width="100%"/><br/>
+      <sub><b>紙 Kami</b> — file explorer</sub>
+    </td>
+    <td align="center" width="50%">
+      <img src="https://hakocorp.github.io/assets/screenshot-panes.png" alt="Split panes with Rei" width="100%"/><br/>
+      <sub>Split panes + <b>零 Rei</b> AI</sub>
+    </td>
+  </tr>
+  <tr>
+    <td align="center" width="50%">
+      <img src="https://hakocorp.github.io/assets/screenshot-editor.png" alt="Editor with help and code" width="100%"/><br/>
+      <sub>Editor with help overlay</sub>
+    </td>
+    <td align="center" width="50%">
+      <img src="https://hakocorp.github.io/assets/screenshot-themes.png" alt="Theme picker" width="100%"/><br/>
+      <sub>Theme picker · 17 presets</sub>
+    </td>
+  </tr>
+</table>
+
+<br>
+
+零 **Rei** lives inside Hako — your in-editor AI assistant, drawn as a little squid:
+
+```
+            ███
+          ███████         ----------
+         █████████        Rei: v1
+        ██ █████ ███      Provider: You Choose
+      ███████████████     Model: You Choose
+      █ ███████████ █     ----------
+        ███████████
+        █ █ █ █ █ █
+```
+
+## Overview
 
 - **Modal Editing**: Vim-inspired normal, insert, visual, and visual-line modes
 - **Full Motion Set**: counts, named registers, text objects (`diw`, `ci"`, `da(`), marks, jumplist, dot-repeat, `:s/` substitution, bracket match
@@ -44,28 +69,39 @@ A minimalistic modal text environment, containing your code without distraction.
 - **17 Themes**: dark, light, gruvbox, nord, dracula, monokai, solarized, tokyonight, catppuccin, onedark, material, everforest, rosepine, github-dark, github-light, ayu, kanagawa
 - **Customizable**: every setting in `.hakorc`, model/provider choices persist in `~/.hako/state`
 
-## Launch Hako
-Compile
-```
-# Grab a C compiler (ex. gcc)
-gcc hako.c -o hako
-```
-Run
-```
-# If not installed, from file path
-./hako or ./hako [filename]
+## Build
 
-# If installed, from anywhere
-hako or hako [filename]
-```
-"Install"
-```
-# From file path (Mac)
-cp hako /usr/local/bin/hako 
+```sh
+# One-liner — works on Linux, macOS, Windows (mingw)
+gcc hako.c -o hako -lpthread
 
-# From file path (Linux)
-cp hako /usr/local/bin/hako
+# Or use the Makefile to also embed the executable icon where the OS allows
+make
 ```
+
+**Run**
+```sh
+./hako              # or  ./hako [filename]
+```
+
+**Install** — drop the binary into your PATH:
+```sh
+cp hako /usr/local/bin/hako          # Linux / macOS
+```
+
+> **Deps:** C standard library + POSIX/Win32 system headers + `pthread`. No third-party libraries linked. AI features shell out to `curl(1)` at runtime.
+
+### Executable icon
+
+The mascot icon files live in `icon/`:
+
+| Platform | File          | What `make` does                                                                |
+|----------|---------------|---------------------------------------------------------------------------------|
+| Windows  | `hako.ico`    | Embeds icon into `.exe` via `windres` — real OS icon.                           |
+| macOS    | `hako.icns`   | Attaches icon as a resource fork via `Rez`+`SetFile` (Xcode CLT). Best-effort.  |
+| Linux    | `hako.png`    | ELF can't embed icons; ship `hako.png` and reference it from a `.desktop` file. |
+
+A plain `gcc hako.c -o hako` produces a working binary on every platform — the icon is purely cosmetic.
 
 ## Key Bindings
 
@@ -389,3 +425,4 @@ Sections of codebase are as follows:
 ## Thank you for your attention.
 This project started out of curiosity and a simple C text editor tutorial. If you hit any issues, feel free to open an issue on GitHub.
 Pull requests, suggestions, or even thoughtful discussions are welcome.
+
