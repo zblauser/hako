@@ -1,7 +1,7 @@
 <p align="center">
   <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="https://hakocorp.github.io/assets/banner-dark.svg">
-    <img src="https://hakocorp.github.io/assets/banner-light.svg" alt="HAKO" width="100%"/>
+    <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/hakocorp/hakocorp.github.io/1a50032f519ae4df58aed8394859084d39206955/assets/banner-dark.svg$0">
+    <img src="https://raw.githubusercontent.com/hakocorp/hakocorp.github.io/1a50032f519ae4df58aed8394859084d39206955/assets/banner-light.svg$0" alt="HAKO" width="100%"/>
   </picture>
 </p>
 
@@ -10,27 +10,27 @@
 </p>
 
 <p align="center">
-  <img src="https://hakocorp.github.io/assets/screenshot-splash.png" alt="Splash" width="80%"/>
+  <img src="https://github.com/hakocorp/hakocorp.github.io/blob/main/assets/screenshot-splash.png?raw=true$0" alt="Splash" width="80%"/>
 </p>
 
 <table align="center">
   <tr>
     <td align="center" width="50%">
-      <img src="https://hakocorp.github.io/assets/screenshot-explorer.png" alt="Kami explorer" width="100%"/><br/>
+      <img src="https://github.com/hakocorp/hakocorp.github.io/blob/main/assets/screenshot-explorer.png?raw=true$0" alt="Kami explorer" width="100%"/><br/>
       <sub><b>紙 Kami</b> — file explorer</sub>
     </td>
     <td align="center" width="50%">
-      <img src="https://hakocorp.github.io/assets/screenshot-panes.png" alt="Split panes with Rei" width="100%"/><br/>
+      <img src="https://github.com/hakocorp/hakocorp.github.io/blob/main/assets/screenshot-panes.png?raw=true$0" alt="Split panes with Rei" width="100%"/><br/>
       <sub>Split panes + <b>零 Rei</b> AI</sub>
     </td>
   </tr>
   <tr>
     <td align="center" width="50%">
-      <img src="https://hakocorp.github.io/assets/screenshot-editor.png" alt="Editor with help and code" width="100%"/><br/>
+      <img src="https://github.com/hakocorp/hakocorp.github.io/blob/main/assets/screenshot-editor.png?raw=true$0" alt="Editor with help and code" width="100%"/><br/>
       <sub>Editor with help overlay</sub>
     </td>
     <td align="center" width="50%">
-      <img src="https://hakocorp.github.io/assets/screenshot-themes.png" alt="Theme picker" width="100%"/><br/>
+      <img src="https://github.com/hakocorp/hakocorp.github.io/blob/main/assets/screenshot-themes.png?raw=true$0" alt="Theme picker" width="100%"/><br/>
       <sub>Theme picker · 17 presets</sub>
     </td>
   </tr>
