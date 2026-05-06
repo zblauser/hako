@@ -1,7 +1,7 @@
 <p align="center">
   <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="https://github.com/hakocorp/hakocorp.github.io/blob/main/assets/banner-dark.gif?raw=true$0">
-    <img src="https://github.com/hakocorp/hakocorp.github.io/blob/main/assets/banner-light.gif?raw=true$0" alt="HAKO" width="100%"/>
+    <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/Orphic-lab/Orphic-lab.github.io/93ac40cc28da504f1ea7714c1c6382f741c04fb8/assets/banner-dark.svg?token=AM5CXPMEES4HM5CEUU3VRU3J7OEKA$0">
+    <img src="https://github.com/Orphic-lab/Orphic-lab.github.io/blob/main/assets/banner-light.gif?raw=true$0" alt="HAKO" width="100%"/>
   </picture>
 </p>
 
@@ -10,27 +10,27 @@
 </p>
 
 <p align="center">
-  <img src="https://github.com/hakocorp/hakocorp.github.io/blob/main/assets/screenshot-splash.png?raw=true$0" alt="Splash" width="80%"/>
+  <img src="https://github.com/Orphic-lab/Orphic-lab.github.io/blob/main/assets/screenshot-splash.png?raw=true$0" alt="Splash" width="80%"/>
 </p>
 
 <table align="center">
   <tr>
     <td align="center" width="50%">
-      <img src="https://github.com/hakocorp/hakocorp.github.io/blob/main/assets/screenshot-explorer.png?raw=true$0" alt="Kami explorer" width="100%"/><br/>
-      <sub><b>紙 Kami</b> — file explorer</sub>
+      <img src="https://github.com/Orphic-lab/Orphic-lab.github.io/blob/main/assets/screenshot-explorer.png?raw=true$0" alt="Kami explorer" width="100%"/><br/>
+      <sub><b>紙 Kami</b>: file explorer</sub>
     </td>
     <td align="center" width="50%">
-      <img src="https://github.com/hakocorp/hakocorp.github.io/blob/main/assets/screenshot-panes.png?raw=true$0" alt="Split panes with Rei" width="100%"/><br/>
+      <img src="https://github.com/Orphic-lab/Orphic-lab.github.io/blob/main/assets/screenshot-rei.png?raw=true$0" alt="Split panes with Rei" width="100%"/><br/>
       <sub>Split panes + <b>零 Rei</b> AI</sub>
     </td>
   </tr>
   <tr>
     <td align="center" width="50%">
-      <img src="https://github.com/hakocorp/hakocorp.github.io/blob/main/assets/screenshot-editor.png?raw=true$0" alt="Editor with help and code" width="100%"/><br/>
-      <sub>Editor with help overlay</sub>
+      <img src="https://github.com/Orphic-lab/Orphic-lab.github.io/blob/main/assets/screenshot-editor.png?raw=true$0" alt="Editor help" width="100%"/><br/>
+      <sub>Editor help overlay</sub>
     </td>
     <td align="center" width="50%">
-      <img src="https://github.com/hakocorp/hakocorp.github.io/blob/main/assets/screenshot-themes.png?raw=true$0" alt="Theme picker" width="100%"/><br/>
+      <img src="https://github.com/Orphic-lab/Orphic-lab.github.io/blob/main/assets/screenshot-themes.png?raw=true$0" alt="Theme picker" width="100%"/><br/>
       <sub>Theme picker · 17 presets</sub>
     </td>
   </tr>
@@ -38,16 +38,12 @@
 
 <br>
 
-零 **Rei** lives inside Hako — your in-editor AI assistant, drawn as a little squid:
+零 **Rei** lives inside Hako; powered by hakoCLAW:
 ```
-            ███
-          ███████         ----------
-         █████████        Rei: v1
-        ██ █████ ███      Provider: You Choose
-      ███████████████     Model: You Choose
-      █ ███████████ █     ----------
-        ███████████
-	    █  █   █  █
+ ▄█████▄
+██ ███ ██ Rei: v1.1
+█████████ Provider: You Choose
+▀█▀▀█▀▀█▀ Model: You Choose
 ```
 
 ## Overview
@@ -55,8 +51,8 @@
 - **Modal Editing**: Vim-inspired normal, insert, visual, and visual-line modes
 - **Full Motion Set**: counts, named registers, text objects (`diw`, `ci"`, `da(`), marks, jumplist, dot-repeat, `:s/` substitution, bracket match
 - **Multi-Pane Support**: Split horizontally and vertically, resize with `Ctrl-W +/-/</>`
-- **File Explorer**: 紙 Kami — directory navigation, hidden-file toggle, dirs-first sort
-- **AI Assistant**: 零 Rei — multi-provider (Anthropic, OpenAI, Ollama), function-calling tool loop, SSE streaming, per-project trust and history
+- **File Explorer**: 紙 Kami - directory navigation, hidden-file toggle, dirs-first sort
+- **AI Assistant**: 零 Rei - multi-provider (Anthropic, OpenAI, Ollama), function-calling tool loop, SSE streaming, per-project trust and history
 - **Skills**: drop `~/.hako/skills/*.md` into the system prompt, install from any URL with `/skill install`
 - **Syntax Highlighting**: 40+ languages, search-match highlighting persists across edits
 - **Undo/Redo**: time-bounded undo blocks, configurable depth
@@ -71,7 +67,7 @@
 ## Build
 
 ```sh
-# One-liner — works on Linux, macOS, Windows (mingw)
+# One-liner - works on Linux, macOS, Windows (mingw)
 gcc hako.c -o hako -lpthread
 
 # Or use the Makefile to also embed the executable icon where the OS allows
@@ -83,7 +79,7 @@ make
 ./hako              # or  ./hako [filename]
 ```
 
-**Install** — drop the binary into your PATH:
+**Install** (drop the binary into your PATH):
 ```sh
 cp hako /usr/local/bin/hako          # Linux / macOS
 ```
@@ -92,15 +88,29 @@ cp hako /usr/local/bin/hako          # Linux / macOS
 
 ### Executable icon
 
-The mascot icon files live in `icon/`:
+The icon files live in `icon/`:
 
 | Platform | File          | What `make` does                                                                |
 |----------|---------------|---------------------------------------------------------------------------------|
-| Windows  | `hako.ico`    | Embeds icon into `.exe` via `windres` — real OS icon.                           |
+| Windows  | `hako.ico`    | Embeds icon into `.exe` via `windres`; real OS icon.                           |
 | macOS    | `hako.icns`   | Attaches icon as a resource fork via `Rez`+`SetFile` (Xcode CLT). Best-effort.  |
 | Linux    | `hako.png`    | ELF can't embed icons; ship `hako.png` and reference it from a `.desktop` file. |
 
-A plain `gcc hako.c -o hako` produces a working binary on every platform — the icon is purely cosmetic.
+A plain `gcc hako.c -o hako` produces a working binary on every platform; the icon is purely cosmetic.
+
+### iSh (iOS - experimental)
+
+hako compiles on Alpine via [iSh](https://ish.app):
+
+```sh
+apk add gcc make musl-dev curl
+make
+```
+
+Notes:
+- AI panel needs `curl` for HTTPS requests; `apk add curl` is required before using Rei.
+- Narrow screens auto-stack the AI panel below the editor instead of squeezing horizontally.
+- iSh runs single-threaded under emulation; expect slower stream rendering.
 
 ## Key Bindings
 
@@ -197,18 +207,24 @@ A plain `gcc hako.c -o hako` produces a working binary on every platform — the
 |Command                 |Action                                       |
 |------------------------|---------------------------------------------|
 |`/help`                 |List commands                                |
-|`/provider <name>`      |ollama, anthropic, openai                    |
+|`/provider <name>`      |ollama, anthropic, openai, deepseek, mistral, together, fireworks, openrouter, groq, xai (auto-fills endpoint) |
 |`/model <id>`           |Switch model (persists to `~/.hako/state`)   |
-|`/tools on|off`         |Toggle function calling                      |
+|`/tools on` / `off`         |Toggle function calling                      |
 |`/trust` / `/trust revoke` | Grant or revoke file-ops in this project  |
 |`/skills [reload]`      |List / reload `~/.hako/skills/*.md`          |
 |`/skill install <url>`  |Download a skill into `~/.hako/skills/`      |
-|`/history [local|global]`|Show path, or move to `<cwd>/.hako/history` |
+|`/history local` / `global`|Show path, or move to `<cwd>/.hako/history` |
 |`/file <path>`          |Inject a local file into context             |
 |`/clear`                |Wipe visible history                         |
+|`/usage`                |Show provider/model/trust + token totals     |
+|`/sessions`             |List up to 16 prior sessions                 |
+|`/session [new]`        |Show session info; `new` resets              |
+|`/resume <id>`          |Switch to prior session                      |
 |`/quit`                 |Close the panel                              |
 
-**Tools** (when trusted): `read_file`, `list_dir`, `write_file` (path constrained to project), `run_shell` (10s timeout).
+**Tools** (when trusted): `read_file`, `list_dir`, `read_open_file`, `list_open_files`, `write_file` (path constrained to project; staged when `ai_autowrite=0`), `run_shell` (project must be trusted).
+
+**Pane control** (any focused pane): `:q rei` / `:q kami` (also `:close <name>`) closes the named side panel.
 
 ## Configuration
 
@@ -224,6 +240,16 @@ smart_indent=1
 mouse_enabled=1
 theme=dark
 explorer_width=30
+
+# AI panel (Rei)
+ai_provider=deepseek          # or anthropic | openai | ollama | mistral | ...
+ai_api_key=sk-...             # not needed for ollama
+ai_model=deepseek-chat
+ai_max_tokens=2048
+ai_tools_enabled=1
+ai_stream=1
+ai_autowrite=1                # 0 stages writes to <path>.hako-pending
+# ai_endpoint=                # auto-set for known providers
 ```
 
 Run `:config` to generate a fully documented `.hakorc` with all options.
@@ -242,7 +268,40 @@ HAKO provides syntax color for 40+ languages, some of which include:
 
 ## Change Log
 
-### v0.0.9 (Latest)<br>
+### v0.1.0 (Latest)<br>
+Polish + portability + safety pass.
+
+Editor / panes
+- Cell-grid diff renderer: front/back buffers, minimal escape emission, no flicker
+- Squished-terminal vertical pane stack: AI auto-stacks below editor when too narrow (≥ 16 rows)
+- Cross-pane close: `:q rei` / `:q kami` (also `:close <name>`) closes named side from any focused pane
+- Explorer border fix; mouse hit-testing covers all panes including stacked
+- Themes: `:theme <name>` / `:colorscheme <name>` runtime switch (17 presets)
+- Binary-file refuse: NUL-byte detection in first 4KB → no garbage spew on image opens
+
+Rei (AI panel)
+- Cursor in prompt: `←/→/↑/↓/Home/End`, BS/DEL splice at cursor, mid-text edits
+- Visual mode in chat history: `j/k/gg/G/Ctrl-D/Ctrl-F/Ctrl-U/Ctrl-B/V/y/Esc/Ctrl-C/Ctrl-W`
+- Provider aliases: `deepseek`, `mistral`, `together`, `fireworks`, `openrouter`, `groq`, `xai/grok`; endpoint auto-filled
+- Token tracking: `/usage` shows `last N in / M out  total ... (cap K)` across Anthropic/OpenAI/Ollama
+- Blockquote tint: AI lines starting `> ` use comment color
+- `ai_autowrite=0` stages writes to `<path>.hako-pending` (line/byte diff returned)
+- Sessions: `/sessions`, `/resume <id>`, `/session [new]`; auto-resume hint on launch
+- Universal tools (Anthropic native + Ollama/OpenAI function-calling fallback)
+- Per-call announcements (`→ read_file(test.txt)` / `← N bytes` / `error: ...`)
+- Spinner: `⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏ thinking...`
+- Streaming: `\n` sanitized live, multi-line split on stream end
+
+Build / release
+- GitHub Actions release workflow (linux/macos/windows on tag `v0.1*`)
+- README documents iSh build (`apk add gcc make musl-dev curl && make`)
+- Makefile unchanged for one-liner: `gcc -O2 -Wall hako.c -o hako -lpthread`
+
+### Previous Versions
+<details>
+<summary>Previous Changes</summary>
+
+***v0.0.9***<br>
 Big one. HAKO goes from editor-with-AI-panel to modal editing environment with a real agent inside.
 
 Editor
@@ -253,11 +312,11 @@ Editor
 - `:q` closes the active pane, not the whole program
 - `dw`, `cw`, `:w file.txt` confirmed working
 - 17 theme presets (dark, light, gruvbox, nord, dracula, monokai, solarized, tokyonight, catppuccin, onedark, material, everforest, rosepine, github-dark, github-light, ayu, kanagawa)
-- Responsive layout — side panels auto-collapse on narrow terminals
+- Responsive layout; side panels auto-collapse on narrow terminals
 - Explorer entries always sorted: directories first, then files, case-insensitive
 - Status bar now uses the border color so panels feel like one chassis
 
-Rei  — 零
+Rei 零
 - Multi-provider: Anthropic, OpenAI, Ollama (swap with `/provider`)
 - Function-calling tool loop (Anthropic): `read_file`, `list_dir`, `write_file`, `run_shell`
 - SSE streaming for text responses
@@ -277,15 +336,10 @@ Fixes
 - Cursor lands in the selected explorer entry and in the Rei input bar instead of the status line
 - Window-size changes resize panes immediately instead of drifting until the next SIGWINCH
 
-
-### Previous Versions
-<details>
-<summary>Previous Changes</summary>
-
 ***v0.0.8***<br>
 Major stability and usability update
 Features
-- Bracketed paste mode support — no more staircase indentation on paste
+- Bracketed paste mode support; no more staircase indentation on paste
 - Rapid-input paste detection fallback for terminals without bracketed paste
 - System clipboard integration (Ctrl-C to copy, Ctrl-V to paste)
 - New vim motions: I, a, A, o, O (insert variants), x (delete char), D (delete to EOL), C (change to EOL)
@@ -293,7 +347,7 @@ Features
 - dd now yanks the deleted line into the paste buffer (vim behavior)
 - Scroll wheel moves cursor naturally (like j/k) instead of jumping the viewport
 - Mouse click works in insert mode without producing artifacts
-- Dynamic line number width — scales for 10,000+ line files
+- Dynamic line number width; scales for 10,000+ line files
 - Improved terminal type detection (Apple Terminal 256-color support)
 - Improved ANSI color fallback for basic terminals (visual selection visible everywhere)
 

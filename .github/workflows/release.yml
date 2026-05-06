@@ -1,0 +1,116 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v0.1*"
+      - "v[1-9]*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag (e.g. v0.1.0)"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: build (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            platform: linux
+            artifact: hako-linux.tar.gz
+          - os: macos-latest
+            platform: macos
+            artifact: hako-macos.tar.gz
+          - os: windows-latest
+            platform: windows
+            artifact: hako-windows.zip
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build (linux)
+        if: matrix.platform == 'linux'
+        run: |
+          make
+          mkdir -p hako-linux
+          cp hako README.md LICENSE hako-linux/
+          cp icon/hako.png hako-linux/
+          tar czf hako-linux.tar.gz hako-linux
+
+      - name: Build (macos)
+        if: matrix.platform == 'macos'
+        run: |
+          make
+          mkdir -p hako-macos
+          cp hako README.md LICENSE hako-macos/
+          cp icon/hako.icns hako-macos/
+          tar czf hako-macos.tar.gz hako-macos
+
+      - name: Set up MSYS2
+        if: matrix.platform == 'windows'
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: true
+          install: >-
+            mingw-w64-x86_64-gcc
+            mingw-w64-x86_64-binutils
+            make
+            zip
+
+      - name: Build (windows)
+        if: matrix.platform == 'windows'
+        shell: msys2 {0}
+        run: |
+          export PATH=/mingw64/bin:$PATH
+          make CC=gcc
+          mkdir -p hako-windows
+          cp hako.exe README.md LICENSE hako-windows/
+          cp icon/hako.ico hako-windows/
+          zip -r hako-windows.zip hako-windows
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ matrix.artifact }}
+          if-no-files-found: error
+
+  release:
+    name: publish release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+
+      - name: Resolve tag
+        id: tag
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "tag=${{ inputs.tag }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.tag }}
+          name: HAKO ${{ steps.tag.outputs.tag }}
+          generate_release_notes: true
+          files: |
+            dist/**/hako-linux.tar.gz
+            dist/**/hako-macos.tar.gz
+            dist/**/hako-windows.zip

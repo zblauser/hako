@@ -17,7 +17,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 */
 				
 /*** includes ***/
-#define HAKO_VERSION "0.0.95"
+#define HAKO_VERSION "0.1.0"
 
 #include <ctype.h>
 #include <errno.h>
@@ -241,6 +241,13 @@ typedef struct {
 	int r, g, b;
 } Color;
 
+typedef struct {
+	char ch[5];
+	Color fg;
+	Color bg;
+	signed char width;
+} Cell;
+
 typedef struct undoState {
 	erow *rows;
 	int numrows;
@@ -299,11 +306,21 @@ typedef struct aiMessage {
 	int raw;
 } aiMessage;
 
+/* history role tags: render uses these to pick prefix + color, replacing
+ * the old msg_idx%2 alternation that scrambled colors when system lines
+ * were interleaved with user/assistant turns. */
+#define HK_ROLE_SYSTEM 0
+#define HK_ROLE_USER   1
+#define HK_ROLE_AI     2
+
 typedef struct aiData {
 	aiProvider *provider;
 	char **history;
+	unsigned char *history_role;
 	int history_count;
 	int history_pos;
+	int scroll_offset;
+	int spinner_frame;
 	int cursor_x;
 	int cursor_y;
 	enum editorMode mode;
@@ -312,6 +329,7 @@ typedef struct aiData {
 	int visual_end;
 	char *prompt_buffer;
 	int prompt_len;
+	int prompt_cursor;
 	int prompt_capacity;
 	char *current_prompt;
 	char *current_response;
@@ -324,6 +342,11 @@ typedef struct aiData {
 	int message_count;
 	int message_cap;
 	char *system_prompt;
+
+	int last_in_tokens;
+	int last_out_tokens;
+	long total_in_tokens;
+	long total_out_tokens;
 } aiData;
 
 typedef struct editorPane {
@@ -460,13 +483,17 @@ struct editorConfig {
 	int force_window_command;
 	int splash_active;
 	int splash_dismissed;
+	int full_redraw_pending;
+
+	Cell *grid_front;
+	Cell *grid_back;
+	int grid_w, grid_h;
 
 	char *explorer_name;
 	char *explorer_kanji;
 	char *ai_name;
 	char *ai_kanji;
-	char *ai_mascot_path;
-	
+
 	int explorer_enabled;
 	int explorer_width;
 	int explorer_show_hidden;
@@ -501,6 +528,13 @@ struct editorConfig {
 	int ai_max_tokens;
 	int ai_tools_enabled;
 	int ai_stream;
+	int ai_autowrite;
+
+	char *session_id;
+	long session_started;
+	long session_last_used;
+	int session_turn_count;
+	int session_resumed;
 	
 	int auto_indent;
 	int smart_indent;
@@ -605,6 +639,7 @@ void hkLoadHistoryTail(aiData *data, int max_msgs);
 int hkLoadSkills(aiData *data);
 void hkSaveSession(void);
 void hkLoadSession(void);
+const char *hkProviderName(enum aiProviderType t);
 static int hkProjectDirPath(char *out, size_t n);
 static int hkProjectTrusted(void);
 static int hkGrantProjectTrust(void);
@@ -649,16 +684,26 @@ void *aiWorkerThread(void *arg);
 char *aiExtractResponse(const char *json, enum aiProviderType type);
 char *aiBuildCurlCommand(aiData *data, enum aiProviderType type);
 void aiAddHistory(aiData *data, const char *text);
+void aiAddHistoryRole(aiData *data, const char *text, unsigned char role);
 int explorerCompare(const void *a, const void *b);
 
 void initTheme(void);
+int editorApplyThemeByName(const char *name);
 void initEditor(void);
 void abAppend(struct abuf *ab, const char *s, int len);
 void abFree(struct abuf *ab);
+void gridResize(int w, int h);
+void gridFree(void);
+void gridClear(Color bg);
+void gridInvalidateFront(void);
+int gridPutStr(int x, int y, const char *s, int max_cols, Color fg, Color bg);
+int gridPutCh(int x, int y, char c, Color fg, Color bg);
+void gridFlush(struct abuf *out);
 int is_separator(int c);
 void setThemeColor(struct abuf *ab, Color color);
 void setThemeBgColor(struct abuf *ab, Color color);
 int editorSyntaxToColor(int hl);
+Color editorSyntaxToRGB(int hl);
 void setColor(struct abuf *ab, int color);
 void setBgColor(struct abuf *ab, int color);
 void detectTerminalType(void);
@@ -1193,6 +1238,7 @@ void disableRawMode() {
 	write(STDOUT_FILENO, "\x1b[?2004l", 8);
 	write(STDOUT_FILENO, "\x1b[?1049l", 8);
 	write(STDOUT_FILENO, "\x1b[?25h", 6);
+	write(STDOUT_FILENO, "\x1b[0 q", 5);
 	write(STDOUT_FILENO, "\x1b[0m", 4);
 	write(STDOUT_FILENO, "\x1b[39m\x1b[49m", 10);
 }
@@ -1268,6 +1314,7 @@ void disableRawMode() {
 	write(STDOUT_FILENO, "\x1b[?1006l", 8);
 	write(STDOUT_FILENO, "\x1b[?1049l", 8);
 	write(STDOUT_FILENO, "\x1b[?25h", 6);
+	write(STDOUT_FILENO, "\x1b[0 q", 5);
 	write(STDOUT_FILENO, "\x1b[0m", 4);
 	write(STDOUT_FILENO, "\x1b[39m\x1b[49m", 10);
 }
@@ -1370,6 +1417,145 @@ void abAppend(struct abuf *ab, const char *s, int len) {
 
 void abFree(struct abuf *ab) {
 	free(ab->b);
+}
+
+/*** cell grid (diff-render) ***/
+static int gridColorEq(Color a, Color b) {
+	return a.r == b.r && a.g == b.g && a.b == b.b;
+}
+
+void gridResize(int w, int h) {
+	if (w < 1) w = 1;
+	if (h < 1) h = 1;
+	if (w == E.grid_w && h == E.grid_h && E.grid_front && E.grid_back) return;
+	free(E.grid_front);
+	free(E.grid_back);
+	E.grid_w = w;
+	E.grid_h = h;
+	int n = w * h;
+	E.grid_front = calloc(n, sizeof(Cell));
+	E.grid_back = calloc(n, sizeof(Cell));
+}
+
+void gridFree(void) {
+	free(E.grid_front);
+	free(E.grid_back);
+	E.grid_front = NULL;
+	E.grid_back = NULL;
+	E.grid_w = 0;
+	E.grid_h = 0;
+}
+
+void gridInvalidateFront(void) {
+	if (E.grid_front && E.grid_w > 0 && E.grid_h > 0) {
+		memset(E.grid_front, 0, (size_t)E.grid_w * E.grid_h * sizeof(Cell));
+	}
+}
+
+void gridClear(Color bg) {
+	if (!E.grid_back) return;
+	int n = E.grid_w * E.grid_h;
+	for (int i = 0; i < n; i++) {
+		Cell *c = &E.grid_back[i];
+		c->ch[0] = ' ';
+		c->ch[1] = 0;
+		c->ch[2] = 0;
+		c->ch[3] = 0;
+		c->ch[4] = 0;
+		c->fg = E.theme.fg;
+		c->bg = bg;
+		c->width = 1;
+	}
+}
+
+static void gridSetCell(int x, int y, const char *utf8, int byte_len, int width, Color fg, Color bg) {
+	if (!E.grid_back) return;
+	if (x < 0 || y < 0 || x >= E.grid_w || y >= E.grid_h) return;
+	if (byte_len < 0) byte_len = 0;
+	if (byte_len > 4) byte_len = 4;
+	Cell *c = &E.grid_back[y * E.grid_w + x];
+	memset(c->ch, 0, sizeof(c->ch));
+	if (byte_len > 0) memcpy(c->ch, utf8, byte_len);
+	else c->ch[0] = ' ';
+	c->fg = fg;
+	c->bg = bg;
+	c->width = (signed char)width;
+	if (width == 2 && x + 1 < E.grid_w) {
+		Cell *cc = &E.grid_back[y * E.grid_w + x + 1];
+		memset(cc->ch, 0, sizeof(cc->ch));
+		cc->fg = fg;
+		cc->bg = bg;
+		cc->width = 0;
+	}
+}
+
+int gridPutStr(int x, int y, const char *s, int max_cols, Color fg, Color bg) {
+	if (!s || max_cols <= 0) return 0;
+	int n = (int)strlen(s);
+	int i = 0;
+	int cols_used = 0;
+	while (i < n && cols_used < max_cols) {
+		unsigned char b = (unsigned char)s[i];
+		if (b < 0x20) { i++; continue; }
+		int blen = utf8_byte_length(b);
+		if (i + blen > n) blen = n - i;
+		int w = utf8_char_width(s, i);
+		if (w < 1) w = 1;
+		if (cols_used + w > max_cols) break;
+		gridSetCell(x + cols_used, y, &s[i], blen, w, fg, bg);
+		cols_used += w;
+		i += blen;
+	}
+	return cols_used;
+}
+
+int gridPutCh(int x, int y, char c, Color fg, Color bg) {
+	gridSetCell(x, y, &c, 1, 1, fg, bg);
+	return 1;
+}
+
+void gridFlush(struct abuf *out) {
+	if (!E.grid_back || !E.grid_front) return;
+	Color cur_fg = { -1, -1, -1 };
+	Color cur_bg = { -1, -1, -1 };
+	int cur_x = -1, cur_y = -1;
+	for (int y = 0; y < E.grid_h; y++) {
+		for (int x = 0; x < E.grid_w; x++) {
+			int idx = y * E.grid_w + x;
+			Cell *bk = &E.grid_back[idx];
+			Cell *fr = &E.grid_front[idx];
+			if (bk->width == 0) continue;
+			int same = (bk->width == fr->width
+				&& memcmp(bk->ch, fr->ch, sizeof(bk->ch)) == 0
+				&& gridColorEq(bk->fg, fr->fg)
+				&& gridColorEq(bk->bg, fr->bg));
+			if (same) continue;
+			if (cur_y != y || cur_x != x) {
+				char buf[32];
+				snprintf(buf, sizeof(buf), "\x1b[%d;%dH", y + 1, x + 1);
+				abAppend(out, buf, strlen(buf));
+				cur_x = x;
+				cur_y = y;
+			}
+			if (!gridColorEq(cur_fg, bk->fg)) {
+				setThemeColor(out, bk->fg);
+				cur_fg = bk->fg;
+			}
+			if (!gridColorEq(cur_bg, bk->bg)) {
+				setThemeBgColor(out, bk->bg);
+				cur_bg = bk->bg;
+			}
+			int blen = 0;
+			while (blen < (int)sizeof(bk->ch) && bk->ch[blen]) blen++;
+			if (blen == 0) { abAppend(out, " ", 1); }
+			else abAppend(out, bk->ch, blen);
+			cur_x += (bk->width > 0 ? bk->width : 1);
+			*fr = *bk;
+			if (bk->width == 2 && x + 1 < E.grid_w) {
+				E.grid_front[idx + 1] = E.grid_back[idx + 1];
+			}
+		}
+	}
 }
 
 /*** helpers ***/
@@ -1567,6 +1753,32 @@ int editorSyntaxToColor(int hl) {
 	}
 }
 
+Color editorSyntaxToRGB(int hl) {
+	int rgb;
+	switch (hl) {
+	case HL_COMMENT: case HL_MLCOMMENT: rgb = 0x6A9955; break;
+	case HL_KEYWORD1: rgb = 0x569CD6; break;
+	case HL_KEYWORD2: rgb = 0x4EC9B0; break;
+	case HL_STRING: rgb = 0xCE9178; break;
+	case HL_NUMBER: rgb = 0xB5CEA8; break;
+	case HL_MATCH: rgb = 0xFFFF00; break;
+	case HL_PREPROCESSOR: rgb = 0xC586C0; break;
+	case HL_FUNCTION: rgb = 0xDCDCAA; break;
+	case HL_TYPE: rgb = 0x4EC9B0; break;
+	case HL_OPERATOR: rgb = 0xD4D4D4; break;
+	case HL_BRACKET: rgb = 0xDA70D6; break;
+	case HL_CONSTANT: rgb = 0x569CD6; break;
+	case HL_BUILTIN: rgb = 0xDCDCAA; break;
+	case HL_ATTRIBUTE: rgb = 0x9CDCFE; break;
+	case HL_CHAR: rgb = 0xE06C75; break;
+	case HL_ESCAPE: rgb = 0xD19A66; break;
+	case HL_LABEL: rgb = 0xC678DD; break;
+	default: rgb = 0xD4D4D4;
+	}
+	Color c = { (rgb >> 16) & 0xFF, (rgb >> 8) & 0xFF, rgb & 0xFF };
+	return c;
+}
+
 void setColor(struct abuf *ab, int color) {
 	char buf[32];
 	
@@ -1680,24 +1892,24 @@ void hkSetRegister(char name, const char *data, int len, int is_line, int is_yan
 
 	int append = (name >= 'A' && name <= 'Z');
 	int idx = hkRegIndex(name);
-	if (idx < 0) return;
 
-	if (name == '+' || name == '*') {
-		FILE *cmd = popen("xclip -selection clipboard 2>/dev/null || pbcopy 2>/dev/null", "w");
-		if (cmd) { fwrite(data, 1, len, cmd); pclose(cmd); }
-		hkRegAssign(&E.hk.registers[idx], data, len, is_line);
-	} else if (append) {
-		hkRegAppend(&E.hk.registers[idx], data, len, is_line);
-	} else {
-		hkRegAssign(&E.hk.registers[idx], data, len, is_line);
+	if (idx >= 0) {
+		if (name == '+' || name == '*') {
+			FILE *cmd = popen("xclip -selection clipboard 2>/dev/null || pbcopy 2>/dev/null", "w");
+			if (cmd) { fwrite(data, 1, len, cmd); pclose(cmd); }
+			hkRegAssign(&E.hk.registers[idx], data, len, is_line);
+		} else if (append) {
+			hkRegAppend(&E.hk.registers[idx], data, len, is_line);
+		} else {
+			hkRegAssign(&E.hk.registers[idx], data, len, is_line);
+		}
+
+		if (name != '"' && name != 0) {
+			hkRegAssign(&E.hk.registers[26], data, len, is_line);
+		}
 	}
 
-	if (name != '"' && name != 0) {
-		hkRegAssign(&E.hk.registers[26], data, len, is_line);
-		editorSetPasteBuffer(data, len, is_line);
-	} else {
-		editorSetPasteBuffer(data, len, is_line);
-	}
+	editorSetPasteBuffer(data, len, is_line);
 
 	if (is_yank) {
 		hkRegAssign(&E.hk.registers[27], data, len, is_line);
@@ -1894,6 +2106,7 @@ void editorFreePane(editorPane *pane) {
 			free(pane->ai->history[i]);
 		}
 		free(pane->ai->history);
+		free(pane->ai->history_role);
 		free(pane->ai->current_prompt);
 		free(pane->ai->current_response);
 		free(pane->ai->prompt_buffer);
@@ -2165,30 +2378,52 @@ void editorResizePanes() {
 	int left_w = E.left_panel ? E.left_panel_width : 0;
 	int right_w = E.right_panel ? E.right_panel_width : 0;
 	int min_editor = 24;
+	int stack_vertical = 0;
+
+	/* AI too wide for side-by-side: stack below if rows allow */
+	if (E.right_panel && E.screencols < min_editor + left_w + right_w && E.screenrows >= 16) {
+		stack_vertical = 1;
+		right_w = 0;
+	}
 
 	if (E.screencols < min_editor + left_w + right_w) {
 		if (right_w > 0 && E.screencols < min_editor + right_w) right_w = 0;
 		if (left_w > 0 && E.screencols < min_editor + left_w + right_w) left_w = 0;
 	}
 
-	E.root_pane->x = left_w;
+	int left_border = (E.left_panel && left_w > 0) ? 1 : 0;
+	int ai_h = 0;
+	if (stack_vertical) {
+		ai_h = E.screenrows / 2;
+		if (ai_h < 6) ai_h = 6;
+		if (ai_h > E.screenrows - 6) ai_h = E.screenrows - 6;
+	}
+
+	E.root_pane->x = left_w + left_border;
 	E.root_pane->y = 0;
-	E.root_pane->width = E.screencols - left_w - right_w;
+	E.root_pane->width = E.screencols - left_w - left_border - right_w;
 	if (E.root_pane->width < 1) E.root_pane->width = 1;
-	E.root_pane->height = E.screenrows;
+	E.root_pane->height = E.screenrows - ai_h;
 
 	if (E.left_panel) {
 		E.left_panel->x = 0;
 		E.left_panel->y = 0;
 		E.left_panel->width = left_w;
-		E.left_panel->height = E.screenrows;
+		E.left_panel->height = E.screenrows - ai_h;
 	}
 
 	if (E.right_panel) {
-		E.right_panel->x = E.screencols - right_w;
-		E.right_panel->y = 0;
-		E.right_panel->width = right_w;
-		E.right_panel->height = E.screenrows;
+		if (stack_vertical) {
+			E.right_panel->x = 0;
+			E.right_panel->y = E.screenrows - ai_h;
+			E.right_panel->width = E.screencols;
+			E.right_panel->height = ai_h;
+		} else {
+			E.right_panel->x = E.screencols - right_w;
+			E.right_panel->y = 0;
+			E.right_panel->width = right_w;
+			E.right_panel->height = E.screenrows;
+		}
 	}
 
 	editorUpdatePaneBounds(E.root_pane);
@@ -3485,6 +3720,18 @@ void editorOpen(char *filename) {
 		}
 	}
 
+	unsigned char peek[4096];
+	size_t peek_n = fread(peek, 1, sizeof(peek), fp);
+	for (size_t i = 0; i < peek_n; i++) {
+		if (peek[i] == 0) {
+			fclose(fp);
+			editorSetStatusMessage("Binary file refused: %s", pane->filename);
+			pane->dirty = 0;
+			return;
+		}
+	}
+	rewind(fp);
+
 	char *line = NULL;
 	size_t linecap = 0;
 	ssize_t linelen;
@@ -3535,34 +3782,30 @@ void editorSave() {
 
 /*** drawing ***/
 void editorDrawPane(editorPane *pane, struct abuf *ab) {
+	(void)ab;
 	if (!pane) return;
-	
+
 	if (pane->split_dir != SPLIT_NONE) {
 		editorDrawPane(pane->child1, ab);
 		editorDrawPane(pane->child2, ab);
-		
-		setThemeBgColor(ab, E.theme.border);
-		setThemeColor(ab, E.theme.border);
+
+		Color border_fg = E.theme.border;
+		Color border_bg = E.theme.border;
 		if (pane->split_dir == SPLIT_VERTICAL) {
-			int split_x = pane->child1->x + pane->child1->width + 1;
+			int split_x = pane->child1->x + pane->child1->width;
 			for (int y = pane->y; y < pane->y + pane->height; y++) {
-				char buf[32];
-				snprintf(buf, sizeof(buf), "\x1b[%d;%dH", y + 1, split_x);
-				abAppend(ab, buf, strlen(buf));
-				abAppend(ab, "│", 3);
+				gridPutStr(split_x, y, "│", 1, border_fg, border_bg);
 			}
 		} else {
-			int split_y = pane->child1->y + pane->child1->height + 1;
-			char buf[32];
-			snprintf(buf, sizeof(buf), "\x1b[%d;%dH", split_y, pane->x + 1);
-			abAppend(ab, buf, strlen(buf));
+			int split_y = pane->child1->y + pane->child1->height;
+			int gx = pane->x;
 			for (int x = 0; x < pane->width; x++) {
-				abAppend(ab, "─", 3);
+				gx += gridPutStr(gx, split_y, "─", 1, border_fg, border_bg);
 			}
 		}
 		return;
 	}
-	
+
 	if (pane->type == PANE_EXPLORER) {
 		explorerRender(pane, ab);
 		return;
@@ -3573,27 +3816,21 @@ void editorDrawPane(editorPane *pane, struct abuf *ab) {
 		return;
 	}
 
-	setThemeBgColor(ab, E.theme.bg);
-
 	int wrap_width = pane->width - E.line_number_width;
 	if (wrap_width < 1) wrap_width = 1;
 
 	for (int screen_y = 0; screen_y < pane->height; screen_y++) {
-		char buf[32];
-		snprintf(buf, sizeof(buf), "\x1b[%d;%dH", pane->y + screen_y + 1, pane->x + 1);
-		abAppend(ab, buf, strlen(buf));
-		
-		setThemeBgColor(ab, E.theme.bg);
-		
+		int gy = pane->y + screen_y;
+		int gx = pane->x;
+
 		int filerow = -1;
 		int wrap_line = 0;
-		
+
 		if (E.word_wrap && pane->wrap_lines) {
 			int visual_row = 0;
 			for (int i = 0; i < pane->numrows; i++) {
 				int lines = (pane->row[i].rsize + wrap_width - 1) / wrap_width;
 				if (lines < 1) lines = 1;
-				
 				if (visual_row + lines > pane->rowoff + screen_y) {
 					filerow = i;
 					wrap_line = pane->rowoff + screen_y - visual_row;
@@ -3605,26 +3842,22 @@ void editorDrawPane(editorPane *pane, struct abuf *ab) {
 			filerow = pane->rowoff + screen_y;
 			wrap_line = 0;
 		}
-		
+
 		if (filerow >= 0 && filerow < pane->numrows) {
 			erow *row = &pane->row[filerow];
-			
+
 			if (E.show_line_numbers) {
 				if (wrap_line == 0) {
 					char line_num[16];
-					int number = E.show_line_numbers == 2 && filerow != pane->cy ? 
+					int number = E.show_line_numbers == 2 && filerow != pane->cy ?
 								abs(filerow - pane->cy) : filerow + 1;
 					int w = E.line_number_width - 1;
 					snprintf(line_num, sizeof(line_num), "%*d ", w, number);
-					setThemeColor(ab, E.theme.line_number);
-					abAppend(ab, line_num, E.line_number_width);
-				} else {
-					setThemeColor(ab, E.theme.line_number);
-					for (int p = 0; p < E.line_number_width; p++)
-						abAppend(ab, " ", 1);
+					gridPutStr(gx, gy, line_num, E.line_number_width, E.theme.line_number, E.theme.bg);
 				}
+				gx += E.line_number_width;
 			}
-			
+
 			int start_col, end_col;
 			if (E.word_wrap && pane->wrap_lines) {
 				start_col = wrap_line * wrap_width;
@@ -3633,81 +3866,79 @@ void editorDrawPane(editorPane *pane, struct abuf *ab) {
 				start_col = pane->coloff;
 				end_col = MIN(pane->coloff + wrap_width, row->rsize);
 			}
-			
+
 			int drawn = 0;
 			for (int j = start_col; j < end_col && drawn < wrap_width; j++) {
-				int is_selected = pane == E.active_pane && 
+				int is_selected = pane == E.active_pane &&
 					(E.mode == MODE_VISUAL || E.mode == MODE_VISUAL_LINE) &&
 					editorIsInVisualSelection(filerow, j);
-				
+
+				Color cell_fg, cell_bg;
 				if (is_selected) {
-					setThemeBgColor(ab, E.theme.visual_bg);
-					setThemeColor(ab, E.theme.visual_fg);
+					cell_fg = E.theme.visual_fg;
+					cell_bg = E.theme.visual_bg;
 				} else {
-					setThemeBgColor(ab, E.theme.bg);
+					cell_bg = E.theme.bg;
 					if (row->hl && j < row->rsize && row->hl[j] == HL_NORMAL) {
-						setThemeColor(ab, E.theme.fg);
+						cell_fg = E.theme.fg;
 					} else if (row->hl && j < row->rsize) {
-						int color = editorSyntaxToColor(row->hl[j]);
-						setColor(ab, color);
+						cell_fg = editorSyntaxToRGB(row->hl[j]);
 					} else {
-						setThemeColor(ab, E.theme.fg);
+						cell_fg = E.theme.fg;
 					}
 				}
-				
+
 				if (j < row->rsize) {
 					unsigned char c = row->render[j];
 					if (c < 32 || c == 127) {
-						abAppend(ab, "?", 1);
+						gridPutCh(gx + drawn, gy, '?', cell_fg, cell_bg);
 						drawn++;
 					} else if (c < 128) {
-						abAppend(ab, &row->render[j], 1);
+						gridPutCh(gx + drawn, gy, (char)c, cell_fg, cell_bg);
 						drawn++;
 					} else {
 						int char_len = utf8_byte_length(c);
 						if (j + char_len <= row->rsize) {
-							abAppend(ab, &row->render[j], char_len);
+							int w = utf8_char_width(row->render, j);
+							if (w < 1) w = 1;
+							if (drawn + w > wrap_width) break;
+							gridPutStr(gx + drawn, gy, &row->render[j], w, cell_fg, cell_bg);
 							j += char_len - 1;
-							drawn += utf8_char_width(row->render, j);
+							drawn += w;
 						} else {
-							abAppend(ab, "?", 1);
+							gridPutCh(gx + drawn, gy, '?', cell_fg, cell_bg);
 							drawn++;
 						}
 					}
 				}
 			}
-			
-			setThemeBgColor(ab, E.theme.bg);
-			for (int x = drawn + (E.show_line_numbers ? E.line_number_width : 0); x < pane->width; x++) {
-				abAppend(ab, " ", 1);
+
+			int fill_start = (E.show_line_numbers ? E.line_number_width : 0) + drawn;
+			for (int x = fill_start; x < pane->width; x++) {
+				gridPutCh(pane->x + x, gy, ' ', E.theme.fg, E.theme.bg);
 			}
 		} else {
-			setThemeBgColor(ab, E.theme.bg);
-			
 			if (E.show_line_numbers) {
-				setThemeColor(ab, E.theme.line_number);
 				for (int p = 0; p < E.line_number_width - 2; p++)
-					abAppend(ab, " ", 1);
-				abAppend(ab, "~ ", 2);
+					gridPutCh(pane->x + p, gy, ' ', E.theme.line_number, E.theme.bg);
+				gridPutStr(pane->x + E.line_number_width - 2, gy, "~ ", 2,
+					E.theme.line_number, E.theme.bg);
 			} else {
-				setThemeColor(ab, E.theme.line_number);
-				abAppend(ab, "~", 1);
+				gridPutCh(pane->x, gy, '~', E.theme.line_number, E.theme.bg);
 			}
-
 			for (int i = E.show_line_numbers ? E.line_number_width : 1; i < pane->width; i++) {
-				abAppend(ab, " ", 1);
+				gridPutCh(pane->x + i, gy, ' ', E.theme.fg, E.theme.bg);
 			}
 		}
 	}
-
-	abAppend(ab, "\x1b[0m", 4);
 }
 
 /*** input ***/
 int editorReadKey() {
+	static int was_streaming = 0;
 	int nread;
 	char c;
-	
+
 	while ((nread = read(STDIN_FILENO, &c, 1)) != 1) {
 		if (nread == -1 && errno != EAGAIN) die("read");
 
@@ -3719,9 +3950,9 @@ int editorReadKey() {
 			return CTRL_KEY('l');
 		}
 #endif
-		if (E.right_panel && E.right_panel->type == PANE_AI && E.right_panel->ai && E.right_panel->ai->streaming) {
-			return 0;
-		}
+		int is_streaming = (E.right_panel && E.right_panel->type == PANE_AI && E.right_panel->ai && E.right_panel->ai->streaming);
+		if (is_streaming) { was_streaming = 1; return 0; }
+		if (was_streaming) { was_streaming = 0; return 0; }
 	}
 
 	if (c == '\x1b') {
@@ -3773,6 +4004,19 @@ int editorReadKey() {
 					case '7': return HOME_KEY;
 					case '8': return END_KEY;
 					}
+				}
+				if (seq[1] == '1' && seq[2] == ';') {
+					if (read(STDIN_FILENO, &seq[3], 1) != 1) return '\x1b';
+					if (read(STDIN_FILENO, &seq[4], 1) != 1) return '\x1b';
+					switch (seq[4]) {
+					case 'A': return ARROW_UP;
+					case 'B': return ARROW_DOWN;
+					case 'C': return ARROW_RIGHT;
+					case 'D': return ARROW_LEFT;
+					case 'H': return HOME_KEY;
+					case 'F': return END_KEY;
+					}
+					return '\x1b';
 				}
 				if (seq[1] == '2' && seq[2] == '0') {
 					if (read(STDIN_FILENO, &seq[3], 1) != 1) return '\x1b';
@@ -3903,23 +4147,75 @@ void editorSetStatusMessage(const char *fmt, ...) {
 	E.statusmsg_time = time(NULL);
 }
 
+static editorPane *editorPaneAtCoord(int x, int y) {
+	if (E.left_panel && x >= E.left_panel->x && x < E.left_panel->x + E.left_panel->width &&
+		y >= E.left_panel->y && y < E.left_panel->y + E.left_panel->height) {
+		return E.left_panel;
+	}
+	if (E.right_panel && x >= E.right_panel->x && x < E.right_panel->x + E.right_panel->width &&
+		y >= E.right_panel->y && y < E.right_panel->y + E.right_panel->height) {
+		return E.right_panel;
+	}
+	editorPane **leaves = NULL;
+	int count = 0;
+	editorCollectLeafPanes(E.root_pane, &leaves, &count);
+	editorPane *hit = NULL;
+	for (int i = 0; i < count; i++) {
+		editorPane *p = leaves[i];
+		if (x >= p->x && x < p->x + p->width && y >= p->y && y < p->y + p->height) {
+			hit = p;
+			break;
+		}
+	}
+	free(leaves);
+	return hit;
+}
+
 void editorProcessMouse(int button, int x, int y) {
+	editorPane *pane = editorPaneAtCoord(x, y);
+	if (pane) {
+		E.active_pane = pane;
+		pane->is_focused = 1;
+		if (E.left_panel && pane != E.left_panel) E.left_panel->is_focused = 0;
+		if (E.right_panel && pane != E.right_panel) E.right_panel->is_focused = 0;
+	}
 	editorPane **panes = NULL;
 	int count = 0;
 	editorCollectLeafPanes(E.root_pane, &panes, &count);
-	
+
 	for (int i = 0; i < count; i++) {
-		editorPane *pane = panes[i];
-		if (x >= pane->x && x < pane->x + pane->width &&
-			y >= pane->y && y < pane->y + pane->height) {
-			E.active_pane = pane;
-			pane->is_focused = 1;
+		if (panes[i] == pane) {
 			
 			if (pane->type == PANE_EDITOR) {
-				int file_y = y - pane->y + pane->rowoff;
-				int file_x = x - pane->x - E.line_number_width + pane->coloff;
-				
-				if (file_y < pane->numrows && file_x >= 0) {
+				int rel_y = y - pane->y;
+				int file_y, file_x;
+				if (E.word_wrap && pane->wrap_lines) {
+					int wrap_width = pane->width - E.line_number_width;
+					if (wrap_width < 1) wrap_width = 1;
+					int target_visual = rel_y + pane->rowoff;
+					int visual = 0;
+					int found = 0;
+					for (int r = 0; r < pane->numrows; r++) {
+						int lines = (pane->row[r].rsize + wrap_width - 1) / wrap_width;
+						if (lines < 1) lines = 1;
+						if (visual + lines > target_visual) {
+							file_y = r;
+							int seg = target_visual - visual;
+							file_x = seg * wrap_width + (x - pane->x - E.line_number_width);
+							found = 1;
+							break;
+						}
+						visual += lines;
+					}
+					if (!found) {
+						file_y = pane->numrows - 1;
+						file_x = 0;
+					}
+				} else {
+					file_y = rel_y + pane->rowoff;
+					file_x = x - pane->x - E.line_number_width + pane->coloff;
+				}
+				if (file_y >= 0 && file_y < pane->numrows && file_x >= 0) {
 					pane->cy = file_y;
 					pane->cx = editorRowRxToCx(&pane->row[file_y], file_x);
 				}
@@ -3936,10 +4232,36 @@ void editorProcessMouse(int button, int x, int y) {
 }
 
 void editorHandleScroll(int direction) {
-	editorPane *pane = E.active_pane;
-	if (!pane || pane->type != PANE_EDITOR) return;
+	editorPane *pane = editorPaneAtCoord(E.mouse_x, E.mouse_y);
+	if (!pane) pane = E.active_pane;
+	if (!pane) return;
 
 	int amount = E.scroll_speed ? E.scroll_speed : 3;
+
+	if (pane->type == PANE_AI && pane->ai) {
+		if (direction == MOUSE_WHEEL_UP) pane->ai->scroll_offset += amount;
+		else if (direction == MOUSE_WHEEL_DOWN) {
+			pane->ai->scroll_offset -= amount;
+			if (pane->ai->scroll_offset < 0) pane->ai->scroll_offset = 0;
+		}
+		return;
+	}
+
+	if (pane->type == PANE_EXPLORER && pane->explorer) {
+		explorerData *d = pane->explorer;
+		if (direction == MOUSE_WHEEL_UP) {
+			d->scroll_offset -= amount;
+			if (d->scroll_offset < 0) d->scroll_offset = 0;
+		} else if (direction == MOUSE_WHEEL_DOWN) {
+			int max_scroll = d->num_entries - (pane->height - 2);
+			if (max_scroll < 0) max_scroll = 0;
+			d->scroll_offset += amount;
+			if (d->scroll_offset > max_scroll) d->scroll_offset = max_scroll;
+		}
+		return;
+	}
+
+	if (pane->type != PANE_EDITOR) return;
 
 	if (direction == MOUSE_WHEEL_UP) {
 		for (int i = 0; i < amount && pane->cy > 0; i++)
@@ -3958,26 +4280,34 @@ void editorHandleScroll(int direction) {
 /*** mode and commands ***/
 void editorSetMode(enum editorMode mode) {
 	E.mode = mode;
+	const char *cursor_seq = NULL;
 	switch (mode) {
 	case MODE_NORMAL:
 		editorSetStatusMessage("-- NORMAL --");
+		cursor_seq = "\x1b[2 q";
 		break;
 	case MODE_INSERT:
 		editorSetStatusMessage("-- INSERT --");
+		cursor_seq = "\x1b[6 q";
 		break;
 	case MODE_VISUAL:
 		editorSetStatusMessage("-- VISUAL --");
+		cursor_seq = "\x1b[2 q";
 		break;
 	case MODE_VISUAL_LINE:
 		editorSetStatusMessage("-- VISUAL LINE --");
+		cursor_seq = "\x1b[2 q";
 		break;
 	case MODE_AI:
 		editorSetStatusMessage("-- AI --");
+		cursor_seq = "\x1b[6 q";
 		break;
 	case MODE_COMMAND:
 		editorSetStatusMessage("-- COMMAND --");
+		cursor_seq = "\x1b[6 q";
 		break;
 	}
+	if (cursor_seq) write(STDOUT_FILENO, cursor_seq, strlen(cursor_seq));
 }
 
 void editorColonCommand() {
@@ -4011,6 +4341,27 @@ void editorColonCommand() {
 		pane->cy = line - 1;
 		pane->cx = 0;
 		pane->rowoff = pane->cy;
+		free(cmd);
+		return;
+	}
+
+	if (strncmp(cmd, "q ", 2) == 0 || strncmp(cmd, "quit ", 5) == 0
+		|| strncmp(cmd, "close ", 6) == 0) {
+		const char *target = strchr(cmd, ' ');
+		while (target && *target == ' ') target++;
+		if (target && *target) {
+			if (strcmp(target, "rei") == 0 || strcmp(target, "ai") == 0
+				|| strcmp(target, "right") == 0) {
+				if (E.right_panel) editorToggleAI();
+				else editorSetStatusMessage("rei not open");
+			} else if (strcmp(target, "kami") == 0 || strcmp(target, "explorer") == 0
+				|| strcmp(target, "left") == 0) {
+				if (E.left_panel) editorToggleExplorer();
+				else editorSetStatusMessage("kami not open");
+			} else {
+				editorSetStatusMessage("unknown pane: %s (rei|kami)", target);
+			}
+		}
 		free(cmd);
 		return;
 	}
@@ -4098,10 +4449,20 @@ void editorColonCommand() {
 		editorSplitPane(1);
 	} else if (strcmp(cmd, "explorer") == 0 || strcmp(cmd, "Explorer") == 0 || strcmp(cmd, "ex") == 0) {
 		editorToggleExplorer();
-	} else if (strcmp(cmd, "ai") == 0) {
+	} else if (strcmp(cmd, "rei") == 0 || strcmp(cmd, "ai") == 0) {
 		editorToggleAI();
 	} else if (strcmp(cmd, "config") == 0 || strcmp(cmd, "genconfig") == 0) {
 		editorGenerateConfig();
+	} else if (strncmp(cmd, "theme ", 6) == 0 || strncmp(cmd, "colorscheme ", 12) == 0) {
+		const char *name = strchr(cmd, ' ');
+		if (name) {
+			while (*name == ' ') name++;
+			if (editorApplyThemeByName(name)) {
+				editorSetStatusMessage("theme: %s", name);
+			} else {
+				editorSetStatusMessage("unknown theme: %s", name);
+			}
+		}
 	} else if (strncmp(cmd, "open ", 5) == 0 || strncmp(cmd, "e ", 2) == 0) {
 		char *filename = cmd + (cmd[0] == 'o' ? 5 : 2);
 		while (*filename == ' ') filename++;
@@ -4232,38 +4593,33 @@ void editorColonCommand() {
 
 /*** main drawing functions ***/
 void editorDrawRows(struct abuf *ab) {
+	(void)ab;
 	if (E.left_panel && E.left_panel->width > 0) {
 		editorDrawPane(E.left_panel, ab);
-
-		setThemeBgColor(ab, E.theme.border);
-		setThemeColor(ab, E.theme.border);
 		int border_x = E.left_panel->x + E.left_panel->width;
 		for (int y = 0; y < E.screenrows; y++) {
-			char buf[32];
-			snprintf(buf, sizeof(buf), "\x1b[%d;%dH", y + 1, border_x);
-			abAppend(ab, buf, strlen(buf));
-			abAppend(ab, "│", 3);
+			gridPutStr(border_x, y, "│", 1, E.theme.border, E.theme.border);
 		}
 	}
 
 	if (E.right_panel && E.right_panel->width > 0) {
 		editorDrawPane(E.right_panel, ab);
 	}
-	
+
 	if (E.root_pane) {
 		editorDrawPane(E.root_pane, ab);
 	}
-	
-	abAppend(ab, "\x1b[0m", 4);
 }
 
 void editorDrawStatusBar(struct abuf *ab) {
-	char buf[32];
-	snprintf(buf, sizeof(buf), "\x1b[%d;1H", E.screenrows + 1);
-	abAppend(ab, buf, strlen(buf));
+	(void)ab;
+	int gy = E.screenrows;
+	Color sb_bg = E.theme.border;
+	Color sb_fg = E.theme.status_fg;
 
-	setThemeBgColor(ab, E.theme.border);
-	setThemeColor(ab, E.theme.status_fg);
+	for (int i = 0; i < E.screencols; i++) {
+		gridPutCh(i, gy, ' ', sb_fg, sb_bg);
+	}
 
 	editorPane *pane = E.active_pane;
 	char status[80], rstatus[80];
@@ -4275,99 +4631,63 @@ void editorDrawStatusBar(struct abuf *ab) {
 			if (slash) display_name = slash + 1;
 		}
 		int len = snprintf(status, sizeof(status), " %.20s %s",
-			display_name ? display_name : "[No Name]", 
+			display_name ? display_name : "[No Name]",
 			pane->dirty ? "[+]" : "");
 		int rlen = snprintf(rstatus, sizeof(rstatus), "%s | %d:%d ",
-			pane->syntax ? pane->syntax->filetype : "text", 
+			pane->syntax ? pane->syntax->filetype : "text",
 			pane->cy + 1, pane->cx + 1);
-
 		if (len > E.screencols) len = E.screencols;
-		abAppend(ab, status, len);
-		while (len < E.screencols) {
-			if (E.screencols - len == rlen) {
-				abAppend(ab, rstatus, rlen);
-				break;
-			} else {
-				abAppend(ab, " ", 1);
-				len++;
-			}
+		gridPutStr(0, gy, status, len, sb_fg, sb_bg);
+		if (rlen <= E.screencols - len) {
+			gridPutStr(E.screencols - rlen, gy, rstatus, rlen, sb_fg, sb_bg);
 		}
 	} else if (pane && pane->type == PANE_EXPLORER) {
 		explorerData *data = pane->explorer;
 		int len = snprintf(status, sizeof(status), " %s %s: %.60s",
 			E.explorer_kanji, E.explorer_name,
 			data && data->current_dir ? data->current_dir : "/");
-		
 		int selected_info_len = 0;
 		if (data && data->num_entries > 0 && data->selected >= 0 && data->selected < data->num_entries) {
-			selected_info_len = snprintf(rstatus, sizeof(rstatus), "%d/%d ", 
+			selected_info_len = snprintf(rstatus, sizeof(rstatus), "%d/%d ",
 				data->selected + 1, data->num_entries);
 		}
-		
 		if (len > E.screencols) len = E.screencols;
-		abAppend(ab, status, len);
-		while (len < E.screencols) {
-			if (selected_info_len > 0 && E.screencols - len == selected_info_len) {
-				abAppend(ab, rstatus, selected_info_len);
-				break;
-			} else {
-				abAppend(ab, " ", 1);
-				len++;
-			}
+		gridPutStr(0, gy, status, len, sb_fg, sb_bg);
+		if (selected_info_len > 0 && selected_info_len <= E.screencols - len) {
+			gridPutStr(E.screencols - selected_info_len, gy, rstatus, selected_info_len, sb_fg, sb_bg);
 		}
 	} else if (pane && pane->type == PANE_AI) {
 		aiData *data = pane->ai;
 		int len = snprintf(status, sizeof(status), " %s %s: %s",
 			E.ai_kanji, E.ai_name,
 			data && data->mode == MODE_INSERT ? "Listening..." : "Ready");
-		
 		int history_info_len = 0;
 		if (data && data->history_count > 0) {
-			history_info_len = snprintf(rstatus, sizeof(rstatus), "%d messages ", 
+			history_info_len = snprintf(rstatus, sizeof(rstatus), "%d messages ",
 				data->history_count);
 		}
-		
 		if (len > E.screencols) len = E.screencols;
-		abAppend(ab, status, len);
-		while (len < E.screencols) {
-			if (history_info_len > 0 && E.screencols - len == history_info_len) {
-				abAppend(ab, rstatus, history_info_len);
-				break;
-			} else {
-				abAppend(ab, " ", 1);
-				len++;
-			}
-		}
-	} else {
-		for (int i = 0; i < E.screencols; i++) {
-			abAppend(ab, " ", 1);
+		gridPutStr(0, gy, status, len, sb_fg, sb_bg);
+		if (history_info_len > 0 && history_info_len <= E.screencols - len) {
+			gridPutStr(E.screencols - history_info_len, gy, rstatus, history_info_len, sb_fg, sb_bg);
 		}
 	}
-
-	abAppend(ab, "\x1b[m", 3);
-	abAppend(ab, "\x1b[39m\x1b[49m", 10);
 }
 
 void editorDrawMessageBar(struct abuf *ab) {
-	char buf[32];
-	snprintf(buf, sizeof(buf), "\x1b[%d;1H", E.screenrows + 2);
-	abAppend(ab, buf, strlen(buf));
-
+	(void)ab;
+	int gy = E.screenrows + 1;
 	Color msg_bg = {37, 37, 38};
-	setThemeBgColor(ab, msg_bg);
-	setThemeColor(ab, E.theme.fg);
+	Color msg_fg = E.theme.fg;
 
 	for (int i = 0; i < E.screencols; i++) {
-		abAppend(ab, " ", 1);
+		gridPutCh(i, gy, ' ', msg_fg, msg_bg);
 	}
-
-	snprintf(buf, sizeof(buf), "\x1b[%d;1H", E.screenrows + 2);
-	abAppend(ab, buf, strlen(buf));
 
 	int msglen = strlen(E.statusmsg);
 	if (msglen > E.screencols) msglen = E.screencols;
 	if (msglen && time(NULL) - E.statusmsg_time < 5) {
-		abAppend(ab, E.statusmsg, msglen);
+		gridPutStr(0, gy, E.statusmsg, msglen, msg_fg, msg_bg);
 	} else {
 		const char *mode_str = "";
 		switch (E.mode) {
@@ -4378,11 +4698,10 @@ void editorDrawMessageBar(struct abuf *ab) {
 		case MODE_AI: mode_str = "-- AI --"; break;
 		case MODE_COMMAND: mode_str = "-- COMMAND --"; break;
 		}
-		abAppend(ab, mode_str, strlen(mode_str));
+		int mlen = strlen(mode_str);
+		if (mlen > E.screencols) mlen = E.screencols;
+		gridPutStr(0, gy, mode_str, mlen, msg_fg, msg_bg);
 	}
-
-	abAppend(ab, "\x1b[m", 3);
-	abAppend(ab, "\x1b[39m\x1b[49m", 10);
 }
 
 void editorRefreshScreen() {
@@ -4390,7 +4709,15 @@ void editorRefreshScreen() {
 		editorDrawSplash();
 		return;
 	}
-	
+
+#ifndef _WIN32
+	if (winch_received) {
+		winch_received = 0;
+		editorUpdateWindowSize();
+		editorResizePanes();
+		E.full_redraw_pending = 1;
+	}
+#endif
 	editorUpdateWindowSize();
 
 	if (E.show_line_numbers) {
@@ -4419,10 +4746,18 @@ void editorRefreshScreen() {
 	struct abuf ab = ABUF_INIT;
 
 	abAppend(&ab, "\x1b[?25l", 6);
+	if (E.full_redraw_pending) {
+		abAppend(&ab, "\x1b[2J", 4);
+		abAppend(&ab, "\x1b[H", 3);
+		gridInvalidateFront();
+		E.full_redraw_pending = 0;
+	}
 
+	gridClear(E.theme.bg);
 	editorDrawRows(&ab);
 	editorDrawStatusBar(&ab);
 	editorDrawMessageBar(&ab);
+	gridFlush(&ab);
 
 	editorPane *pane = E.active_pane;
 	if (pane && pane->type == PANE_EDITOR) {
@@ -4477,6 +4812,9 @@ void editorRefreshScreen() {
 		int vline = 0;
 		int col_in_line = 0;
 		int total_vlines = 0;
+		int pcur = adata->prompt_cursor;
+		if (pcur < 0) pcur = 0;
+		if (pcur > adata->prompt_len) pcur = adata->prompt_len;
 		if (adata->prompt_buffer && adata->prompt_len > 0) {
 			int i = 0;
 			while (i <= adata->prompt_len) {
@@ -4486,9 +4824,9 @@ void editorRefreshScreen() {
 				int seg = line_start;
 				do {
 					int take = (line_end - seg > seg_w) ? seg_w : (line_end - seg);
-					if (adata->prompt_len > seg && adata->prompt_len <= seg + take) {
+					if (pcur >= seg && pcur <= seg + take && pcur <= line_end) {
 						vline = total_vlines;
-						col_in_line = adata->prompt_len - seg;
+						col_in_line = pcur - seg;
 					}
 					total_vlines++;
 					seg += take;
@@ -4497,7 +4835,7 @@ void editorRefreshScreen() {
 				i++;
 				if (i == adata->prompt_len + 1) break;
 			}
-			if (adata->prompt_len > 0 && adata->prompt_buffer[adata->prompt_len - 1] == '\n') {
+			if (adata->prompt_len > 0 && adata->prompt_buffer[adata->prompt_len - 1] == '\n' && pcur == adata->prompt_len) {
 				vline = total_vlines;
 				col_in_line = 0;
 				total_vlines++;
@@ -4640,6 +4978,24 @@ static void hkDotRepeat(void) {
 				editorRowAppendString(&pane->row[pane->cy], pane->row[pane->cy + 1].chars, pane->row[pane->cy + 1].size);
 				editorDelRow(pane->cy + 1);
 			}
+		}
+		break;
+	case 'w':
+	case 'W':
+		if (pane->cy < pane->numrows) {
+			erow *row = &pane->row[pane->cy];
+			int start = pane->cx;
+			int end = pane->cx;
+			while (end < row->size && !is_separator(row->chars[end])) end++;
+			while (end < row->size && is_separator(row->chars[end]) && row->chars[end] != '\n') end++;
+			if (end > start) {
+				memmove(&row->chars[start], &row->chars[end], row->size - end + 1);
+				row->size -= (end - start);
+				editorUpdateRow(row);
+				pane->dirty++;
+				if (pane->cx >= row->size && pane->cx > 0) pane->cx = row->size > 0 ? row->size - 1 : 0;
+			}
+			if (E.hk.last_op == 'W') hkReplayInsert();
 		}
 		break;
 	}
@@ -4787,7 +5143,7 @@ void editorProcessKeyPress() {
 
 		E.splash_active = 0;
 		E.splash_dismissed = 1;
-		editorSetStatusMessage(":h = help | :w = write | :q = quit | / = find | ^W = window | :ai = kaku");
+		editorSetStatusMessage(":h = help | :w = write | :q = quit | / = find | ^W = window | :rei/:ai = agent");
 		return;
 	}
 
@@ -4833,8 +5189,23 @@ void editorProcessKeyPress() {
 		case '+':
 		case '-':
 		case '<':
-		case '>':
-			if (E.active_pane && E.active_pane->parent && E.active_pane->parent->split_dir != SPLIT_NONE) {
+		case '>': {
+			int delta_cols = (c == '+' || c == '>') ? 4 : -4;
+			if (E.active_pane == E.left_panel && E.left_panel) {
+				int nw = E.left_panel_width + delta_cols;
+				int max_w = E.screencols - (E.right_panel ? E.right_panel_width : 0) - 10;
+				if (nw >= 10 && nw <= max_w) {
+					E.left_panel_width = nw;
+					editorResizePanes();
+				}
+			} else if (E.active_pane == E.right_panel && E.right_panel) {
+				int nw = E.right_panel_width - delta_cols;
+				int max_w = E.screencols - (E.left_panel ? E.left_panel_width : 0) - 10;
+				if (nw >= 10 && nw <= max_w) {
+					E.right_panel_width = nw;
+					editorResizePanes();
+				}
+			} else if (E.active_pane && E.active_pane->parent && E.active_pane->parent->split_dir != SPLIT_NONE) {
 				float delta = (c == '+' || c == '>') ? 0.05 : -0.05;
 				float new_ratio = E.active_pane->parent->split_ratio + delta;
 				if (E.active_pane->parent->child2 == E.active_pane) new_ratio = E.active_pane->parent->split_ratio - delta;
@@ -4844,6 +5215,7 @@ void editorProcessKeyPress() {
 				}
 			}
 			break;
+		}
 		default:
 			editorSetStatusMessage("Unknown window command");
 			break;
@@ -4890,10 +5262,10 @@ void editorProcessKeyPress() {
 			if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
 				c == '"' || c == '+' || c == '*' || c == '0' || c == '_' || c == '-') {
 				E.hk.pending_reg = (char)c;
-				editorSetStatusMessage("\"%c", c);
+				editorSetStatusMessage("reg=\"%c (key=%d)", c, c);
 			} else {
 				E.hk.pending_reg = 0;
-				editorSetStatusMessage("register canceled");
+				editorSetStatusMessage("register canceled (key=%d)", c);
 			}
 			return;
 		}
@@ -4901,7 +5273,7 @@ void editorProcessKeyPress() {
 		if (c == '"') {
 			last_char = 0; g_pressed = 0; d_pressed = 0;
 			E.hk.waiting_reg = 1;
-			editorSetStatusMessage("\"");
+			editorSetStatusMessage("\" (waiting for register name)");
 			return;
 		}
 
@@ -4914,7 +5286,7 @@ void editorProcessKeyPress() {
 				editorSaveState();
 				hkApplyLineOp(pane, op, sx, ex);
 			} else {
-				editorSetStatusMessage("No text object");
+				editorSetStatusMessage("No text object: %c%c%c at %d,%d (cursor must be inside)", op, c, (obj >= 32 && obj < 127) ? obj : '?', pane->cx, pane->cy);
 			}
 			last_char = 0; g_pressed = 0; d_pressed = 0;
 			return;
@@ -5092,6 +5464,7 @@ void editorProcessKeyPress() {
 			hkRecordStart('a', hkConsumeCount());
 			editorSetMode(MODE_INSERT);
 			editorSaveState();
+			editorSetStatusMessage("INSERT via 'a' (waiting_reg was %d)", E.hk.waiting_reg);
 			break;
 
 		case 'A':
@@ -5329,6 +5702,7 @@ void editorProcessKeyPress() {
 
 		case 'w':
 			if (d_pressed || last_char == 'c') {
+				int was_change = (last_char == 'c');
 				editorSaveState();
 				if (pane->cy < pane->numrows) {
 					erow *row = &pane->row[pane->cy];
@@ -5344,7 +5718,13 @@ void editorProcessKeyPress() {
 						pane->dirty++;
 						if (pane->cx >= row->size && pane->cx > 0) pane->cx = row->size > 0 ? row->size - 1 : 0;
 					}
-					if (last_char == 'c') editorSetMode(MODE_INSERT);
+					if (was_change) {
+						hkRecordStart('W', 1);
+						editorSetMode(MODE_INSERT);
+					} else {
+						E.hk.last_op = 'w';
+						E.hk.last_count = 1;
+					}
 				}
 				E.hk.pending_reg = 0;
 				last_char = 0;
@@ -5352,21 +5732,27 @@ void editorProcessKeyPress() {
 				g_pressed = 0;
 				break;
 			}
-			if (pane->cy < pane->numrows) {
-				erow *row = &pane->row[pane->cy];
-				while (pane->cx < row->size && !is_separator(row->chars[pane->cx])) pane->cx++;
-				while (pane->cx < row->size && is_separator(row->chars[pane->cx])) pane->cx++;
-				if (pane->cx >= row->size && pane->cy < pane->numrows - 1) {
-					pane->cy++;
-					pane->cx = 0;
+			{
+				int n = hkConsumeCount();
+				for (int k = 0; k < n; k++) {
+					if (pane->cy >= pane->numrows) break;
+					erow *row = &pane->row[pane->cy];
+					while (pane->cx < row->size && !is_separator(row->chars[pane->cx])) pane->cx++;
+					while (pane->cx < row->size && is_separator(row->chars[pane->cx])) pane->cx++;
+					if (pane->cx >= row->size && pane->cy < pane->numrows - 1) {
+						pane->cy++;
+						pane->cx = 0;
+					}
 				}
 			}
 			last_char = 0;
 			g_pressed = 0;
 			break;
 
-		case 'b':
-			if (pane->cx > 0 || pane->cy > 0) {
+		case 'b': {
+			int n = hkConsumeCount();
+			for (int k = 0; k < n; k++) {
+				if (pane->cx == 0 && pane->cy == 0) break;
 				if (pane->cx == 0 && pane->cy > 0) {
 					pane->cy--;
 					pane->cx = pane->row[pane->cy].size;
@@ -5379,10 +5765,12 @@ void editorProcessKeyPress() {
 			last_char = 0;
 			g_pressed = 0;
 			break;
+		}
 
 		case '0':
 		case HOME_KEY:
 			pane->cx = 0;
+			E.hk.pending_count = 0;
 			last_char = 0;
 			g_pressed = 0;
 			break;
@@ -5392,6 +5780,7 @@ void editorProcessKeyPress() {
 			if (pane->cy < pane->numrows) {
 				pane->cx = pane->row[pane->cy].size;
 			}
+			E.hk.pending_count = 0;
 			last_char = 0;
 			g_pressed = 0;
 			break;
@@ -6019,11 +6408,12 @@ void explorerRefresh(editorPane *pane) {
 			is_dir = S_ISDIR(st.st_mode);
 		}
 
-		data->entries[i] = malloc(strlen(ent->d_name) + 4);
+		size_t bufsz = strlen(ent->d_name) + 4;
+		data->entries[i] = malloc(bufsz);
 		if (is_dir) {
-			sprintf(data->entries[i], "%s/", ent->d_name);
+			snprintf(data->entries[i], bufsz, "%s/", ent->d_name);
 		} else {
-			strcpy(data->entries[i], ent->d_name);
+			snprintf(data->entries[i], bufsz, "%s", ent->d_name);
 		}
 		i++;
 	}
@@ -6045,64 +6435,57 @@ void explorerRefresh(editorPane *pane) {
 }
 
 void explorerRender(editorPane *pane, struct abuf *ab) {
+	(void)ab;
 	explorerData *data = pane->explorer;
 	if (!data) return;
 
 	for (int y = 0; y < pane->height; y++) {
-		char buf[64];
-		snprintf(buf, sizeof(buf), "\x1b[%d;%dH", pane->y + y + 1, pane->x + 1);
-		abAppend(ab, buf, strlen(buf));
-		
-		setThemeBgColor(ab, E.theme.bg);
+		int gy = pane->y + y;
+		int gx = pane->x;
 
 		if (y == 0) {
-			setThemeBgColor(ab, E.theme.status_bg);
-			setThemeColor(ab, E.theme.status_fg);
+			Color hf = E.theme.status_fg;
+			Color hb = E.theme.status_bg;
 			char header[64];
 			snprintf(header, sizeof(header), " %s %s ", E.explorer_kanji, E.explorer_name);
-			int header_len = strlen(header);
-			if (header_len > pane->width) {
-				abAppend(ab, header, pane->width);
-			} else {
-				abAppend(ab, header, header_len);
-				for (int x = header_len; x < pane->width; x++) {
-					abAppend(ab, " ", 1);
-				}
+			int used = gridPutStr(gx, gy, header, pane->width, hf, hb);
+			for (int x = used; x < pane->width; x++) {
+				gridPutCh(gx + x, gy, ' ', hf, hb);
 			}
 		} else if (y == 1) {
-			setThemeColor(ab, E.theme.border);
-			for (int x = 0; x < pane->width; x++) {
-				abAppend(ab, "─", 3);
+			int used = 0;
+			while (used < pane->width) {
+				int w = gridPutStr(gx + used, gy, "─", pane->width - used, E.theme.border, E.theme.bg);
+				if (w <= 0) break;
+				used += w;
 			}
 		} else {
 			int idx = (y - 2) + data->scroll_offset;
 			if (idx < data->num_entries && data->entries && data->entries[idx]) {
+				Color row_fg, row_bg;
 				if (idx == data->selected) {
-					setThemeBgColor(ab, E.theme.visual_bg);
-					setThemeColor(ab, E.theme.visual_fg);
+					row_fg = E.theme.visual_fg;
+					row_bg = E.theme.visual_bg;
 				} else {
 					int is_dir = (strchr(data->entries[idx], '/') != NULL);
-					setThemeColor(ab, is_dir ? E.theme.keyword2 : E.theme.fg);
+					row_fg = is_dir ? E.theme.keyword2 : E.theme.fg;
+					row_bg = E.theme.bg;
 				}
-				
-				abAppend(ab, " ", 1);
-				int len = strlen(data->entries[idx]);
-				if (len > pane->width - 2) len = pane->width - 2;
-				abAppend(ab, data->entries[idx], len);
-				
-				setThemeBgColor(ab, E.theme.bg);
-				for (int x = len + 1; x < pane->width; x++) {
-					abAppend(ab, " ", 1);
+				gridPutCh(gx, gy, ' ', row_fg, row_bg);
+				int name_len = strlen(data->entries[idx]);
+				int max = pane->width - 2;
+				if (name_len > max) name_len = max;
+				int used = gridPutStr(gx + 1, gy, data->entries[idx], max, row_fg, row_bg);
+				for (int x = 1 + used; x < pane->width; x++) {
+					gridPutCh(gx + x, gy, ' ', row_fg, row_bg);
 				}
 			} else {
 				for (int x = 0; x < pane->width; x++) {
-					abAppend(ab, " ", 1);
+					gridPutCh(gx + x, gy, ' ', E.theme.fg, E.theme.bg);
 				}
 			}
 		}
 	}
-
-	abAppend(ab, "\x1b[0m", 4);
 }
 
 void explorerHandleKey(editorPane *pane, int key) {
@@ -6218,6 +6601,52 @@ void explorerHandleKey(editorPane *pane, int key) {
 		}
 		break;
 
+	case 'o':
+		if (data->num_entries > 0 && data->entries && data->entries[data->selected] &&
+			!strchr(data->entries[data->selected], '/')) {
+			char full_path[PATH_MAX];
+			snprintf(full_path, sizeof(full_path), "%s/%s", data->current_dir, data->entries[data->selected]);
+
+			editorPane *target = NULL;
+			editorPane **panes = NULL;
+			int count = 0;
+			editorCollectLeafPanes(E.root_pane, &panes, &count);
+			for (int i = 0; i < count; i++) {
+				if (panes[i] && panes[i]->type == PANE_EDITOR) { target = panes[i]; break; }
+			}
+			free(panes);
+			if (!target) {
+				editorSetStatusMessage("No editor pane available");
+				break;
+			}
+
+			if (target->width < 40) {
+				editorSetStatusMessage("Not enough room to split — use <Enter> to open in current pane");
+				break;
+			}
+
+			int prev_num_panes = E.num_panes;
+			E.active_pane = target;
+			editorSplitPane(1);
+			if (E.num_panes == prev_num_panes) {
+				break;
+			}
+
+			editorPane *np = E.active_pane;
+			for (int i = 0; i < np->numrows; i++) editorFreeRow(&np->row[i]);
+			free(np->row);
+			np->row = NULL;
+			np->numrows = 0;
+			np->cx = np->cy = np->rowoff = np->coloff = 0;
+			free(np->filename);
+			np->filename = NULL;
+			np->dirty = 0;
+
+			editorOpen(full_path);
+			editorSetStatusMessage("Opened in new pane: %s", full_path);
+		}
+		break;
+
 	case '.':
 		E.explorer_show_hidden = !E.explorer_show_hidden;
 		explorerRefresh(pane);
@@ -6268,13 +6697,8 @@ void editorToggleExplorer() {
 		}
 		editorFreePane(E.left_panel);
 		E.left_panel = NULL;
-		
-		int offset = E.right_panel ? E.right_panel_width : 0;
-		if (E.root_pane) {
-			E.root_pane->x = 0;
-			E.root_pane->width = E.screencols - offset;
-			editorUpdatePaneBounds(E.root_pane);
-		}
+
+		editorResizePanes();
 		return;
 	}
 	
@@ -6287,13 +6711,8 @@ void editorToggleExplorer() {
 	E.left_panel = editorCreatePane(PANE_EXPLORER, 0, 0, E.left_panel_width, E.screenrows);
 	E.left_panel->wrap_lines = 0;
 	explorerInit(E.left_panel);
-	
-	int right_offset = E.right_panel ? E.right_panel_width : 0;
-	if (E.root_pane) {
-		E.root_pane->x = E.left_panel_width;
-		E.root_pane->width = E.screencols - E.left_panel_width - right_offset;
-		editorUpdatePaneBounds(E.root_pane);
-	}
+
+	editorResizePanes();
 	
 	editorSetStatusMessage("Explorer opened");
 }
@@ -6310,6 +6729,12 @@ void editorInitAI() {
 	E.ai_max_tokens = 2048;
 	E.ai_tools_enabled = 1;
 	E.ai_stream = 1;
+	E.ai_autowrite = 1;
+	E.session_id = NULL;
+	E.session_started = 0;
+	E.session_last_used = 0;
+	E.session_turn_count = 0;
+	E.session_resumed = 0;
 }
 
 void editorCleanupAI() {
@@ -6330,8 +6755,10 @@ void aiInit(editorPane *pane) {
 	if (!data) return;
 	
 	data->history = malloc(sizeof(char*) * AI_HISTORY_MAX);
+	data->history_role = calloc(AI_HISTORY_MAX, 1);
 	data->history_count = 0;
 	data->history_pos = 0;
+	data->scroll_offset = 0;
 	data->cursor_x = 0;
 	data->cursor_y = 0;
 	data->mode = MODE_NORMAL;
@@ -6342,6 +6769,7 @@ void aiInit(editorPane *pane) {
 	data->prompt_buffer[0] = '\0';
 	data->prompt_capacity = 256;
 	data->prompt_len = 0;
+	data->prompt_cursor = 0;
 	data->current_prompt = NULL;
 	data->current_response = NULL;
 	data->active = 1;
@@ -6349,69 +6777,49 @@ void aiInit(editorPane *pane) {
 	pthread_mutex_init(&data->lock, NULL);
 	
 	const char *default_mascot[] = {
-		"      ███",
-		"    ███████",
-		"   █████████",
-		"  ██ █████ ██",
-		"███████████████",
-		"█ ███████████ █",
-		"  ███████████",
-		"  █  █   █  █",
+    	"  ▄█████▄ ",
+  		" ██ ███ ██",
+   		" █████████",
+   		" ▀█▀▀█▀▀█▀",
 		NULL
 	};
-
-	if (E.ai_mascot_path && *E.ai_mascot_path) {
-		FILE *mfp = fopen(E.ai_mascot_path, "r");
-		if (mfp) {
-			char line[1024];
-			while (fgets(line, sizeof(line), mfp) && data->history_count < AI_HISTORY_MAX - 8) {
-				char *nl = strchr(line, '\n'); if (nl) *nl = '\0';
-				data->history[data->history_count++] = strdup(line);
-			}
-			fclose(mfp);
-			goto mascot_done;
-		}
-	}
-
 	for (int i = 0; default_mascot[i]; i++) {
 		if (data->history_count < AI_HISTORY_MAX) {
 			data->history[data->history_count++] = strdup(default_mascot[i]);
 		}
 	}
 
-mascot_done: ;
+	const char *pname = hkProviderName(E.ai_provider_type);
 
-	char welcome[128];
-	snprintf(welcome, sizeof(welcome), "Welcome to %s!", E.ai_name);
-	data->history[data->history_count++] = strdup(welcome);
-
-	const char *pname = "none";
-	switch (E.ai_provider_type) {
-	case AI_PROVIDER_OLLAMA: pname = "Ollama"; break;
-	case AI_PROVIDER_ANTHROPIC: pname = "Anthropic"; break;
-	case AI_PROVIDER_OPENAI: pname = "OpenAI"; break;
-	default: break;
+	data->history[data->history_count++] = strdup("-----");
+	char line[128];
+	snprintf(line, sizeof(line), "%s v1.1", E.ai_name);
+	data->history[data->history_count++] = strdup(line);
+	snprintf(line, sizeof(line), "provider: %s", pname);
+	data->history[data->history_count++] = strdup(line);
+	if (E.ai_model) {
+		snprintf(line, sizeof(line), "model: %s", E.ai_model);
+		data->history[data->history_count++] = strdup(line);
 	}
-
-	if (E.ai_provider_type != AI_PROVIDER_NONE) {
-		char status[128];
-		snprintf(status, sizeof(status), "Provider: %s", pname);
-		data->history[data->history_count++] = strdup(status);
-		if (E.ai_model) {
-			char minfo[128];
-			snprintf(minfo, sizeof(minfo), "Model: %s", E.ai_model);
-			data->history[data->history_count++] = strdup(minfo);
-		}
+	if (E.ai_provider_type == AI_PROVIDER_NONE) {
+		data->history[data->history_count++] = strdup("(set ai_provider in .hakorc)");
+	}
+	snprintf(line, sizeof(line), "trust: %s", hkProjectTrusted() ? "granted" : "off");
+	data->history[data->history_count++] = strdup(line);
+	if (E.session_resumed) {
+		long ago = (long)time(NULL) - E.session_last_used;
+		const char *unit;
+		long n;
+		if (ago < 3600) { n = ago / 60; unit = "m"; }
+		else if (ago < 86400) { n = ago / 3600; unit = "h"; }
+		else { n = ago / 86400; unit = "d"; }
+		snprintf(line, sizeof(line), "session: resumed (%ld%s, %d turns)", n, unit, E.session_turn_count);
 	} else {
-		data->history[data->history_count++] = strdup("No provider configured.");
-		data->history[data->history_count++] = strdup("Set ai_provider in .hakorc");
+		snprintf(line, sizeof(line), "session: new");
 	}
-
-	data->history[data->history_count++] = strdup("");
-	data->history[data->history_count++] = strdup(hkProjectTrusted()
-		? "Trusted project. Tools enabled."
-		: "Untrusted. /trust to grant file access.");
-	data->history[data->history_count++] = strdup("'i' to chat, '/help' for commands");
+	data->history[data->history_count++] = strdup(line);
+	data->history[data->history_count++] = strdup("-----");
+	data->history[data->history_count++] = strdup("'i' chat | /help");
 
 	pane->ai = data;
 
@@ -6430,13 +6838,16 @@ static int aiSubmitPrompt(aiData *data) {
 		int r = hkHandleSlash(data, data->prompt_buffer);
 		data->prompt_buffer[0] = '\0';
 		data->prompt_len = 0;
+		data->prompt_cursor = 0;
 		data->mode = MODE_NORMAL;
 		data->history_pos = MAX(0, data->history_count - 20);
 		editorSetStatusMessage("-- AI NORMAL --");
 		return r;
 	}
-	aiAddHistory(data, data->prompt_buffer);
+	aiAddHistoryRole(data, data->prompt_buffer, HK_ROLE_USER);
 	hkLogMessage("user", data->prompt_buffer);
+	E.session_turn_count++;
+	hkSaveSession();
 
 	free(data->current_prompt);
 	data->current_prompt = strdup(data->prompt_buffer);
@@ -6466,6 +6877,8 @@ void aiHandleKey(editorPane *pane, int key) {
 	pthread_mutex_lock(&data->lock);
 
 	if (data->mode == MODE_INSERT) {
+		if (data->prompt_cursor < 0) data->prompt_cursor = 0;
+		if (data->prompt_cursor > data->prompt_len) data->prompt_cursor = data->prompt_len;
 		switch (key) {
 		case '\x1b':
 			data->mode = MODE_NORMAL;
@@ -6474,11 +6887,68 @@ void aiHandleKey(editorPane *pane, int key) {
 
 		case BACKSPACE:
 		case CTRL_KEY('h'):
-		case DEL_KEY:
-			if (data->prompt_len > 0) {
-				data->prompt_buffer[--data->prompt_len] = '\0';
+			if (data->prompt_cursor > 0) {
+				memmove(data->prompt_buffer + data->prompt_cursor - 1,
+					data->prompt_buffer + data->prompt_cursor,
+					data->prompt_len - data->prompt_cursor + 1);
+				data->prompt_cursor--;
+				data->prompt_len--;
 			}
 			break;
+
+		case DEL_KEY:
+			if (data->prompt_cursor < data->prompt_len) {
+				memmove(data->prompt_buffer + data->prompt_cursor,
+					data->prompt_buffer + data->prompt_cursor + 1,
+					data->prompt_len - data->prompt_cursor);
+				data->prompt_len--;
+			}
+			break;
+
+		case ARROW_LEFT:
+			if (data->prompt_cursor > 0) data->prompt_cursor--;
+			break;
+		case ARROW_RIGHT:
+			if (data->prompt_cursor < data->prompt_len) data->prompt_cursor++;
+			break;
+		case ARROW_UP: {
+			int line_start = data->prompt_cursor;
+			while (line_start > 0 && data->prompt_buffer[line_start - 1] != '\n') line_start--;
+			int col = data->prompt_cursor - line_start;
+			if (line_start == 0) break;
+			int prev_end = line_start - 1;
+			int prev_start = prev_end;
+			while (prev_start > 0 && data->prompt_buffer[prev_start - 1] != '\n') prev_start--;
+			int prev_len = prev_end - prev_start;
+			data->prompt_cursor = prev_start + (col < prev_len ? col : prev_len);
+			break;
+		}
+		case ARROW_DOWN: {
+			int line_start = data->prompt_cursor;
+			while (line_start > 0 && data->prompt_buffer[line_start - 1] != '\n') line_start--;
+			int col = data->prompt_cursor - line_start;
+			int line_end = data->prompt_cursor;
+			while (line_end < data->prompt_len && data->prompt_buffer[line_end] != '\n') line_end++;
+			if (line_end >= data->prompt_len) break;
+			int next_start = line_end + 1;
+			int next_end = next_start;
+			while (next_end < data->prompt_len && data->prompt_buffer[next_end] != '\n') next_end++;
+			int next_len = next_end - next_start;
+			data->prompt_cursor = next_start + (col < next_len ? col : next_len);
+			break;
+		}
+		case HOME_KEY: {
+			int ls = data->prompt_cursor;
+			while (ls > 0 && data->prompt_buffer[ls - 1] != '\n') ls--;
+			data->prompt_cursor = ls;
+			break;
+		}
+		case END_KEY: {
+			int le = data->prompt_cursor;
+			while (le < data->prompt_len && data->prompt_buffer[le] != '\n') le++;
+			data->prompt_cursor = le;
+			break;
+		}
 
 		case '\r':
 		case '\n':
@@ -6486,8 +6956,11 @@ void aiHandleKey(editorPane *pane, int key) {
 				data->prompt_capacity *= 2;
 				data->prompt_buffer = realloc(data->prompt_buffer, data->prompt_capacity);
 			}
-			data->prompt_buffer[data->prompt_len++] = '\n';
-			data->prompt_buffer[data->prompt_len] = '\0';
+			memmove(data->prompt_buffer + data->prompt_cursor + 1,
+				data->prompt_buffer + data->prompt_cursor,
+				data->prompt_len - data->prompt_cursor + 1);
+			data->prompt_buffer[data->prompt_cursor++] = '\n';
+			data->prompt_len++;
 			break;
 
 		default:
@@ -6496,8 +6969,11 @@ void aiHandleKey(editorPane *pane, int key) {
 					data->prompt_capacity *= 2;
 					data->prompt_buffer = realloc(data->prompt_buffer, data->prompt_capacity);
 				}
-				data->prompt_buffer[data->prompt_len++] = key;
-				data->prompt_buffer[data->prompt_len] = '\0';
+				memmove(data->prompt_buffer + data->prompt_cursor + 1,
+					data->prompt_buffer + data->prompt_cursor,
+					data->prompt_len - data->prompt_cursor + 1);
+				data->prompt_buffer[data->prompt_cursor++] = key;
+				data->prompt_len++;
 			}
 			break;
 		}
@@ -6562,6 +7038,52 @@ void aiHandleKey(editorPane *pane, int key) {
 			pthread_mutex_unlock(&data->lock);
 			editorNextPane();
 			return;
+
+		case 'g':
+			data->cursor_y = 0;
+			data->visual_end = 0;
+			data->scroll_offset = 1000000;
+			break;
+
+		case 'G':
+			data->cursor_y = data->history_count > 0 ? data->history_count - 1 : 0;
+			data->visual_end = data->cursor_y;
+			data->scroll_offset = 0;
+			break;
+
+		case CTRL_KEY('d'):
+		case CTRL_KEY('f'): {
+			int step = pane->height / 2;
+			if (step < 1) step = 1;
+			data->cursor_y += step;
+			if (data->cursor_y > data->history_count - 1)
+				data->cursor_y = data->history_count > 0 ? data->history_count - 1 : 0;
+			data->visual_end = data->cursor_y;
+			data->scroll_offset -= step;
+			if (data->scroll_offset < 0) data->scroll_offset = 0;
+			break;
+		}
+
+		case CTRL_KEY('u'):
+		case CTRL_KEY('b'): {
+			int step = pane->height / 2;
+			if (step < 1) step = 1;
+			data->cursor_y -= step;
+			if (data->cursor_y < 0) data->cursor_y = 0;
+			data->visual_end = data->cursor_y;
+			data->scroll_offset += step;
+			break;
+		}
+
+		case 'V':
+			data->visual_start = data->visual_end = data->cursor_y;
+			break;
+
+		case CTRL_KEY('c'):
+			data->visual_mode = 0;
+			data->visual_start = data->visual_end = -1;
+			editorSetStatusMessage("-- AI NORMAL --");
+			break;
 		}
 	} else {
 		switch (key) {
@@ -6590,22 +7112,21 @@ void aiHandleKey(editorPane *pane, int key) {
 			
 		case 'j':
 		case ARROW_DOWN:
-			if (data->cursor_y < data->history_count - 1) {
-				data->cursor_y++;
-				if (data->cursor_y - data->history_pos >= pane->height - 3) {
-					data->history_pos++;
-				}
-			}
+			if (data->scroll_offset > 0) data->scroll_offset--;
 			break;
-			
+
 		case 'k':
 		case ARROW_UP:
-			if (data->cursor_y > 0) {
-				data->cursor_y--;
-				if (data->cursor_y < data->history_pos) {
-					data->history_pos = data->cursor_y;
-				}
-			}
+			data->scroll_offset++;
+			break;
+
+		case CTRL_KEY('d'):
+			data->scroll_offset -= pane->height / 2;
+			if (data->scroll_offset < 0) data->scroll_offset = 0;
+			break;
+
+		case CTRL_KEY('u'):
+			data->scroll_offset += pane->height / 2;
 			break;
 			
 		case 'h':
@@ -6626,17 +7147,11 @@ void aiHandleKey(editorPane *pane, int key) {
 			break;
 			
 		case 'g':
-			data->cursor_y = 0;
-			data->cursor_x = 0;
-			data->history_pos = 0;
+			data->scroll_offset = 1000000;
 			break;
-			
+
 		case 'G':
-			if (data->history_count > 0) {
-				data->cursor_y = data->history_count - 1;
-				data->cursor_x = 0;
-				data->history_pos = MAX(0, data->history_count - pane->height + 3);
-			}
+			data->scroll_offset = 0;
 			break;
 			
 		case ':':
@@ -6714,12 +7229,7 @@ void editorToggleAI() {
 		editorFreePane(E.right_panel);
 		E.right_panel = NULL;
 
-		int offset = E.left_panel ? E.left_panel_width : 0;
-		if (E.root_pane) {
-			E.root_pane->x = offset;
-			E.root_pane->width = E.screencols - offset;
-			editorUpdatePaneBounds(E.root_pane);
-		}
+		editorResizePanes();
 		return;
 	}
 	
@@ -6748,13 +7258,8 @@ void editorToggleAI() {
 	E.right_panel = editorCreatePane(PANE_AI, E.screencols - E.right_panel_width, 0, E.right_panel_width, E.screenrows);
 	E.right_panel->wrap_lines = 1;
 	aiInit(E.right_panel);
-	
-	int left_offset = E.left_panel ? E.left_panel_width : 0;
-	if (E.root_pane) {
-		E.root_pane->x = left_offset;
-		E.root_pane->width = E.screencols - left_offset - E.right_panel_width;
-		editorUpdatePaneBounds(E.root_pane);
-	}
+
+	editorResizePanes();
 	
 	editorSetStatusMessage("Rei Assistant - 'i' for insert, ESC for normal, 'v' for visual");
 }
@@ -6770,6 +7275,7 @@ void editorSendToAI(const char *prompt) {
 			pthread_mutex_lock(&data->lock);
 			
 			if (data->history_count < AI_HISTORY_MAX) {
+				data->history_role[data->history_count] = HK_ROLE_USER;
 				data->history[data->history_count] = strdup(prompt);
 				data->history_count++;
 			}
@@ -6857,97 +7363,159 @@ void aiRender(editorPane *pane, struct abuf *ab) {
 			total_vis++;
 		}
 	}
+	int spinner_row = -1;
+	if (data->streaming) {
+		if (total_vis >= owner_cap) {
+			owner_cap = owner_cap ? owner_cap * 2 : 64;
+			line_owner = realloc(line_owner, sizeof(int) * owner_cap);
+			line_sub = realloc(line_sub, sizeof(int) * owner_cap);
+		}
+		line_owner[total_vis] = -1;
+		line_sub[total_vis] = 0;
+		spinner_row = total_vis;
+		total_vis++;
+	}
 
 	int history_rows = history_end - 2 + 1;
 	if (history_rows < 0) history_rows = 0;
-	int scroll = total_vis > history_rows ? total_vis - history_rows : 0;
+	int max_scroll = total_vis > history_rows ? total_vis - history_rows : 0;
+	if (data->scroll_offset < 0) data->scroll_offset = 0;
+	if (data->scroll_offset > max_scroll) data->scroll_offset = max_scroll;
+	int scroll = max_scroll - data->scroll_offset;
+	if (scroll < 0) scroll = 0;
 
 	for (int y = 0; y < pane->height; y++) {
-		char buf[64];
-		snprintf(buf, sizeof(buf), "\x1b[%d;%dH", pane->y + y + 1, pane->x + 1);
-		abAppend(ab, buf, strlen(buf));
+		int gy = pane->y + y;
+		int gx = pane->x;
 
-		setThemeBgColor(ab, E.theme.border);
-		setThemeColor(ab, E.theme.border);
-		abAppend(ab, "│", 3);
-
-		setThemeBgColor(ab, E.theme.bg);
+		gridPutStr(gx, gy, "│", 1, E.theme.border, E.theme.border);
 
 		if (y == 0) {
-			setThemeBgColor(ab, E.theme.status_bg);
-			setThemeColor(ab, E.theme.status_fg);
+			Color hf = E.theme.status_fg;
+			Color hb = E.theme.status_bg;
 			char header[64];
 			snprintf(header, sizeof(header), " %s %s ", E.ai_kanji, E.ai_name);
-			int hlen = strlen(header);
-			if (hlen > pane->width - 1) hlen = pane->width - 1;
-			abAppend(ab, header, hlen);
-			for (int x = hlen; x < pane->width - 1; x++) abAppend(ab, " ", 1);
-		} else if (y == 1) {
-			setThemeColor(ab, E.theme.border);
-			for (int x = 0; x < pane->width - 1; x++) abAppend(ab, "─", 3);
-		} else if (y == history_end + 1) {
-			setThemeColor(ab, E.theme.border);
-			for (int x = 0; x < pane->width - 1; x++) abAppend(ab, "─", 3);
+			int max = pane->width - 1;
+			int used = gridPutStr(gx + 1, gy, header, max, hf, hb);
+			for (int x = used; x < max; x++) {
+				gridPutCh(gx + 1 + x, gy, ' ', hf, hb);
+			}
+		} else if (y == 1 || y == history_end + 1) {
+			int used = 0;
+			while (used < pane->width - 1) {
+				int w = gridPutStr(gx + 1 + used, gy, "─", pane->width - 1 - used, E.theme.border, E.theme.bg);
+				if (w <= 0) break;
+				used += w;
+			}
 		} else if (y >= history_end + 2) {
 			int prow = y - (history_end + 2);
-			abAppend(ab, " ", 1);
+			int cx = gx + 1;
+			gridPutCh(cx, gy, ' ', E.theme.fg, E.theme.bg);
+			cx++;
 			int vline = prow + pscroll;
 			if (prow < plines) {
-				setThemeColor(ab, data->mode == MODE_INSERT ? E.theme.keyword1 : E.theme.comment);
+				Color pfx_fg = (data->mode == MODE_INSERT) ? E.theme.keyword1 : E.theme.comment;
 				const char *pfx = (vline == 0) ? (data->mode == MODE_INSERT ? "> " : "  ") : "  ";
-				abAppend(ab, pfx, 2);
+				gridPutStr(cx, gy, pfx, 2, pfx_fg, E.theme.bg);
+				cx += 2;
 
 				int pw = inner_w - 2;
 				int shown = 0;
 				if (data->prompt_buffer && data->prompt_len > 0 && vline < plines_total) {
 					int len = pend[vline] - pstart[vline];
 					if (len > pw) len = pw;
-					if (len > 0) abAppend(ab, data->prompt_buffer + pstart[vline], len);
-					shown = len;
+					if (len > 0) {
+						char tmp[1024];
+						if (len > (int)sizeof(tmp) - 1) len = (int)sizeof(tmp) - 1;
+						memcpy(tmp, data->prompt_buffer + pstart[vline], len);
+						tmp[len] = '\0';
+						shown = gridPutStr(cx, gy, tmp, pw, E.theme.fg, E.theme.bg);
+					}
 				} else if (vline == 0 && data->mode != MODE_INSERT) {
-					setThemeColor(ab, E.theme.comment);
 					const char *hint = "press 'i' to type, Enter to send";
-					int hl = strlen(hint);
-					if (hl > pw) hl = pw;
-					abAppend(ab, hint, hl);
-					shown = hl;
+					shown = gridPutStr(cx, gy, hint, pw, E.theme.comment, E.theme.bg);
 				}
-				for (int x = shown; x < pw; x++) abAppend(ab, " ", 1);
+				for (int x = shown; x < pw; x++) {
+					gridPutCh(cx + x, gy, ' ', E.theme.fg, E.theme.bg);
+				}
+				cx += pw;
 			} else {
-				for (int x = 0; x < inner_w; x++) abAppend(ab, " ", 1);
+				for (int x = 0; x < inner_w; x++) {
+					gridPutCh(cx + x, gy, ' ', E.theme.fg, E.theme.bg);
+				}
+				cx += inner_w;
 			}
-			abAppend(ab, " ", 1);
+			gridPutCh(cx, gy, ' ', E.theme.fg, E.theme.bg);
 		} else {
 			int vrow = (y - 2) + scroll;
-			abAppend(ab, " ", 1);
+			int cx = gx + 1;
+			gridPutCh(cx, gy, ' ', E.theme.fg, E.theme.bg);
+			cx++;
+			if (vrow == spinner_row && spinner_row >= 0) {
+				static const char *frames[] = {"⠋","⠙","⠹","⠸","⠼","⠴","⠦","⠧","⠇","⠏"};
+				data->spinner_frame = (data->spinner_frame + 1) % 10;
+				int f = data->spinner_frame;
+				int sx = cx;
+				sx += gridPutStr(sx, gy, frames[f], 1, E.theme.string, E.theme.bg);
+				sx += gridPutStr(sx, gy, " thinking...", 12, E.theme.string, E.theme.bg);
+				int filled = sx - cx;
+				for (int x = filled; x < inner_w; x++) {
+					gridPutCh(cx + x, gy, ' ', E.theme.fg, E.theme.bg);
+				}
+				cx += inner_w;
+				gridPutCh(cx, gy, ' ', E.theme.fg, E.theme.bg);
+				continue;
+			}
 			if (vrow >= 0 && vrow < total_vis) {
 				int msg_idx = line_owner[vrow];
 				int sub = line_sub[vrow];
 				char *text = data->history[msg_idx];
-				int seg_w = inner_w - 2;
+				int seg_max = inner_w - 2;
 				int byte_off = 0, seg_len = 0, seg_cols = 0;
-				utf8_slice(text, sub * seg_w, seg_w, &byte_off, &seg_len, &seg_cols);
+				utf8_slice(text, sub * seg_max, seg_max, &byte_off, &seg_len, &seg_cols);
 
 				int is_selected = (data->visual_mode &&
 					msg_idx >= MIN(data->visual_start, data->visual_end) &&
 					msg_idx <= MAX(data->visual_start, data->visual_end));
+				unsigned char role = data->history_role[msg_idx];
+
+				Color bar_fg, body_fg, row_bg;
 				if (is_selected) {
-					setThemeBgColor(ab, E.theme.visual_bg);
-					setThemeColor(ab, E.theme.visual_fg);
+					bar_fg = E.theme.visual_fg;
+					body_fg = E.theme.visual_fg;
+					row_bg = E.theme.visual_bg;
 				} else {
-					setThemeColor(ab, msg_idx % 2 == 0 ? E.theme.keyword1 : E.theme.comment);
+					row_bg = E.theme.bg;
+					if (role == HK_ROLE_USER) { bar_fg = E.theme.keyword1; body_fg = E.theme.keyword1; }
+					else if (role == HK_ROLE_AI) { bar_fg = E.theme.string; body_fg = E.theme.fg; }
+					else { bar_fg = E.theme.comment; body_fg = E.theme.comment; }
+					if (role == HK_ROLE_AI && text && text[0] == '>' && (text[1] == ' ' || text[1] == '\0')) {
+						body_fg = E.theme.comment;
+					}
 				}
 
-				if (sub == 0) abAppend(ab, msg_idx % 2 == 0 ? "> " : "  ", 2);
-				else abAppend(ab, "  ", 2);
+				const char *bar = (role == HK_ROLE_USER || role == HK_ROLE_AI) ? "▌ " : "  ";
+				gridPutStr(cx, gy, bar, 2, bar_fg, row_bg);
+				cx += 2;
 
-				if (seg_len > 0) abAppend(ab, text + byte_off, seg_len);
-				setThemeBgColor(ab, E.theme.bg);
-				for (int x = seg_cols + 2; x < inner_w; x++) abAppend(ab, " ", 1);
+				if (seg_len > 0) {
+					char tmp[2048];
+					int n = seg_len < (int)sizeof(tmp) - 1 ? seg_len : (int)sizeof(tmp) - 1;
+					memcpy(tmp, text + byte_off, n);
+					tmp[n] = '\0';
+					gridPutStr(cx, gy, tmp, seg_max, body_fg, row_bg);
+				}
+				for (int x = seg_cols; x < seg_max; x++) {
+					gridPutCh(cx + x, gy, ' ', body_fg, row_bg);
+				}
+				cx += seg_max;
 			} else {
-				for (int x = 0; x < inner_w; x++) abAppend(ab, " ", 1);
+				for (int x = 0; x < inner_w; x++) {
+					gridPutCh(cx + x, gy, ' ', E.theme.fg, E.theme.bg);
+				}
+				cx += inner_w;
 			}
-			abAppend(ab, " ", 1);
+			gridPutCh(cx, gy, ' ', E.theme.fg, E.theme.bg);
 		}
 	}
 
@@ -6956,8 +7524,7 @@ void aiRender(editorPane *pane, struct abuf *ab) {
 	free(pstart);
 	free(pend);
 	pthread_mutex_unlock(&data->lock);
-
-	abAppend(ab, "\x1b[0m", 4);
+	(void)ab;
 }
 
 /*** ai transport ***/
@@ -7050,8 +7617,8 @@ void hkLogMessage(const char *role, const char *content) {
 	char *esc = malloc(cap);
 	if (!esc) { fclose(fp); return; }
 	hkJsonEscapeInto(content ? content : "", esc, cap);
-	fprintf(fp, "{\"ts\":%ld,\"role\":\"%s\",\"content\":\"%s\"}\n",
-		(long)time(NULL), role, esc);
+	fprintf(fp, "{\"ts\":%ld,\"sid\":\"%s\",\"role\":\"%s\",\"content\":\"%s\"}\n",
+		(long)time(NULL), E.session_id ? E.session_id : "", role, esc);
 	free(esc);
 	fclose(fp);
 }
@@ -7099,8 +7666,20 @@ void hkLoadHistoryTail(aiData *data, int max_msgs) {
 	free(line);
 	fclose(fp);
 
-	int start = lcount > max_msgs ? lcount - max_msgs : 0;
-	for (int i = start; i < lcount; i++) {
+	int kept = 0;
+	int *keep_idx = malloc(sizeof(int) * lcount);
+	for (int i = 0; i < lcount; i++) {
+		char *l = lines[i];
+		if (E.session_id) {
+			char tag[64];
+			snprintf(tag, sizeof(tag), "\"sid\":\"%s\"", E.session_id);
+			if (!strstr(l, tag)) continue;
+		}
+		keep_idx[kept++] = i;
+	}
+	int start = kept > max_msgs ? kept - max_msgs : 0;
+	for (int k = start; k < kept; k++) {
+		int i = keep_idx[k];
 		char *l = lines[i];
 		char *role = strstr(l, "\"role\":\"");
 		char *content = strstr(l, "\"content\":\"");
@@ -7117,14 +7696,15 @@ void hkLoadHistoryTail(aiData *data, int max_msgs) {
 				char rtag = *role;
 				char *text = hkJsonUnescape(content, cend - content);
 				if (text) {
-					char disp[128];
-					snprintf(disp, sizeof(disp), "[%c] %s", rtag, text);
-					aiAddHistory(data, disp);
+					unsigned char r = (rtag == 'u') ? HK_ROLE_USER
+						: (rtag == 'a') ? HK_ROLE_AI : HK_ROLE_SYSTEM;
+					aiAddHistoryRole(data, text, r);
 					free(text);
 				}
 			}
 		}
 	}
+	free(keep_idx);
 	for (int i = 0; i < lcount; i++) free(lines[i]);
 	free(lines);
 }
@@ -7174,7 +7754,7 @@ int hkLoadSkills(aiData *data) {
 	return loaded;
 }
 
-static const char *hkProviderName(enum aiProviderType t) {
+const char *hkProviderName(enum aiProviderType t) {
 	switch (t) {
 	case AI_PROVIDER_OLLAMA: return "ollama";
 	case AI_PROVIDER_ANTHROPIC: return "anthropic";
@@ -7187,15 +7767,32 @@ static enum aiProviderType hkParseProvider(const char *s) {
 	if (strcmp(s, "ollama") == 0) return AI_PROVIDER_OLLAMA;
 	if (strcmp(s, "anthropic") == 0 || strcmp(s, "claude") == 0) return AI_PROVIDER_ANTHROPIC;
 	if (strcmp(s, "openai") == 0 || strcmp(s, "gpt") == 0 || strcmp(s, "groq") == 0) return AI_PROVIDER_OPENAI;
+	if (strcmp(s, "deepseek") == 0 || strcmp(s, "mistral") == 0 || strcmp(s, "together") == 0
+		|| strcmp(s, "fireworks") == 0 || strcmp(s, "openrouter") == 0
+		|| strcmp(s, "xai") == 0 || strcmp(s, "grok") == 0) return AI_PROVIDER_OPENAI;
 	return AI_PROVIDER_NONE;
 }
 
-void hkSaveSession(void) {
-	char dir[512];
-	hkHakoDirPath(dir, sizeof(dir));
-	if (!dir[0]) return;
-	char path[640];
-	snprintf(path, sizeof(path), "%s/state", dir);
+static const char *hkProviderDefaultEndpoint(const char *s) {
+	if (strcmp(s, "deepseek") == 0)   return "https://api.deepseek.com";
+	if (strcmp(s, "mistral") == 0)    return "https://api.mistral.ai";
+	if (strcmp(s, "together") == 0)   return "https://api.together.xyz";
+	if (strcmp(s, "fireworks") == 0)  return "https://api.fireworks.ai/inference";
+	if (strcmp(s, "openrouter") == 0) return "https://openrouter.ai/api";
+	if (strcmp(s, "groq") == 0)       return "https://api.groq.com/openai";
+	if (strcmp(s, "xai") == 0 || strcmp(s, "grok") == 0) return "https://api.x.ai";
+	return NULL;
+}
+
+static void hkApplyProviderAlias(const char *val) {
+	enum aiProviderType t = hkParseProvider(val);
+	if (t == AI_PROVIDER_NONE) return;
+	E.ai_provider_type = t;
+	const char *ep = hkProviderDefaultEndpoint(val);
+	if (ep && !E.ai_endpoint) E.ai_endpoint = strdup(ep);
+}
+
+static void hkWriteSessionFile(const char *path) {
 	FILE *fp = fopen(path, "w");
 	if (!fp) return;
 	fprintf(fp, "ai_provider=%s\n", hkProviderName(E.ai_provider_type));
@@ -7203,15 +7800,31 @@ void hkSaveSession(void) {
 	if (E.ai_endpoint) fprintf(fp, "ai_endpoint=%s\n", E.ai_endpoint);
 	fprintf(fp, "ai_tools_enabled=%d\n", E.ai_tools_enabled);
 	fprintf(fp, "ai_stream=%d\n", E.ai_stream);
+	fprintf(fp, "ai_autowrite=%d\n", E.ai_autowrite);
+	if (E.session_id) fprintf(fp, "session_id=%s\n", E.session_id);
+	fprintf(fp, "session_started=%ld\n", E.session_started);
+	fprintf(fp, "session_last_used=%ld\n", (long)time(NULL));
+	fprintf(fp, "session_turn_count=%d\n", E.session_turn_count);
 	fclose(fp);
 }
 
-void hkLoadSession(void) {
+void hkSaveSession(void) {
 	char dir[512];
 	hkHakoDirPath(dir, sizeof(dir));
-	if (!dir[0]) return;
-	char path[640];
-	snprintf(path, sizeof(path), "%s/state", dir);
+	if (dir[0]) {
+		char path[640];
+		snprintf(path, sizeof(path), "%s/state", dir);
+		hkWriteSessionFile(path);
+	}
+	char pdir[PATH_MAX];
+	if (hkProjectDirPath(pdir, sizeof(pdir))) {
+		char ppath[PATH_MAX + 8];
+		snprintf(ppath, sizeof(ppath), "%s/state", pdir);
+		hkWriteSessionFile(ppath);
+	}
+}
+
+static void hkLoadSessionFile(const char *path, int allow_session_fields) {
 	FILE *fp = fopen(path, "r");
 	if (!fp) return;
 	char *line = NULL;
@@ -7234,10 +7847,62 @@ void hkLoadSession(void) {
 			E.ai_tools_enabled = atoi(val) ? 1 : 0;
 		} else if (strcmp(key, "ai_stream") == 0) {
 			E.ai_stream = atoi(val) ? 1 : 0;
+		} else if (strcmp(key, "ai_autowrite") == 0) {
+			E.ai_autowrite = atoi(val) ? 1 : 0;
+		} else if (allow_session_fields && strcmp(key, "session_id") == 0) {
+			free(E.session_id);
+			E.session_id = strdup(val);
+		} else if (allow_session_fields && strcmp(key, "session_started") == 0) {
+			E.session_started = atol(val);
+		} else if (allow_session_fields && strcmp(key, "session_last_used") == 0) {
+			E.session_last_used = atol(val);
+		} else if (allow_session_fields && strcmp(key, "session_turn_count") == 0) {
+			E.session_turn_count = atoi(val);
 		}
 	}
 	free(line);
 	fclose(fp);
+}
+
+static void hkGenSessionId(void) {
+	free(E.session_id);
+	E.session_id = malloc(17);
+	long now = (long)time(NULL);
+	srand((unsigned)(now ^ getpid()));
+	snprintf(E.session_id, 17, "%lx%04x", now & 0xffffffff, rand() & 0xffff);
+}
+
+void hkLoadSession(void) {
+	char dir[512];
+	hkHakoDirPath(dir, sizeof(dir));
+	if (dir[0]) {
+		char path[640];
+		snprintf(path, sizeof(path), "%s/state", dir);
+		hkLoadSessionFile(path, 0);
+	}
+	char pdir[PATH_MAX];
+	int has_project = 0;
+	char ppath[PATH_MAX + 8];
+	if (hkProjectDirPath(pdir, sizeof(pdir))) {
+		struct stat st;
+		snprintf(ppath, sizeof(ppath), "%s/state", pdir);
+		if (stat(ppath, &st) == 0) {
+			has_project = 1;
+			hkLoadSessionFile(ppath, 1);
+		}
+	}
+
+	long now = (long)time(NULL);
+	int recent = E.session_last_used > 0 && (now - E.session_last_used) < 7 * 24 * 3600;
+	if (has_project && E.session_id && recent) {
+		E.session_resumed = 1;
+	} else {
+		E.session_resumed = 0;
+		E.session_started = now;
+		E.session_last_used = 0;
+		E.session_turn_count = 0;
+		hkGenSessionId();
+	}
 }
 
 int hkHandleSlash(aiData *data, const char *prompt) {
@@ -7250,11 +7915,14 @@ int hkHandleSlash(aiData *data, const char *prompt) {
 	if (strncmp(cmd, "help", cmdlen) == 0 && cmdlen == 4) {
 		aiAddHistory(data, "/clear  /help  /model <id>  /provider <name>");
 		aiAddHistory(data, "/file <path>  /history [local|global]  /skills [reload]");
-		aiAddHistory(data, "/skill install <url>  /tools on|off  /quit");
+		aiAddHistory(data, "/skill install <url>  /skill uninstall <name>");
+		aiAddHistory(data, "/tools on|off  /trust [revoke]  /usage  /quit");
+		aiAddHistory(data, "/sessions  /resume <id>  /session [new]");
 		return 1;
 	}
 	if (strncmp(cmd, "clear", cmdlen) == 0 && cmdlen == 5) {
 		for (int i = 0; i < data->history_count; i++) free(data->history[i]);
+		memset(data->history_role, 0, AI_HISTORY_MAX);
 		data->history_count = 0;
 		data->cursor_y = data->history_pos = 0;
 		aiAddHistory(data, "(cleared)");
@@ -7279,12 +7947,15 @@ int hkHandleSlash(aiData *data, const char *prompt) {
 		if (arg && *arg) {
 			enum aiProviderType t = hkParseProvider(arg);
 			if (t == AI_PROVIDER_NONE) {
-				aiAddHistory(data, "unknown provider (ollama/anthropic/openai/groq)");
+				aiAddHistory(data, "unknown (ollama/anthropic/openai/groq/deepseek/mistral/together/fireworks/openrouter/xai)");
 			} else {
-				E.ai_provider_type = t;
+				hkApplyProviderAlias(arg);
 				hkSaveSession();
 				char msg[256];
-				snprintf(msg, sizeof(msg), "provider: %s (saved)", hkProviderName(t));
+				snprintf(msg, sizeof(msg), "provider: %s (saved)%s%s",
+					hkProviderName(t),
+					hkProviderDefaultEndpoint(arg) ? " endpoint=" : "",
+					hkProviderDefaultEndpoint(arg) ? hkProviderDefaultEndpoint(arg) : "");
 				aiAddHistory(data, msg);
 			}
 		} else {
@@ -7384,8 +8055,31 @@ int hkHandleSlash(aiData *data, const char *prompt) {
 		return 1;
 	}
 	if (strncmp(cmd, "skill", cmdlen) == 0 && cmdlen == 5) {
+		if (arg && strncmp(arg, "uninstall ", 10) == 0) {
+			const char *name = arg + 10;
+			while (*name == ' ') name++;
+			if (!*name) { aiAddHistory(data, "usage: /skill uninstall <name>"); return 1; }
+			char dir[512];
+			hkHakoDirPath(dir, sizeof(dir));
+			char path[1024];
+			int nlen = strlen(name);
+			if (nlen >= 4 && strcmp(name + nlen - 3, ".md") == 0) {
+				snprintf(path, sizeof(path), "%s/skills/%s", dir, name);
+			} else {
+				snprintf(path, sizeof(path), "%s/skills/%s.md", dir, name);
+			}
+			if (unlink(path) == 0) {
+				int n = hkLoadSkills(data);
+				char msg[128];
+				snprintf(msg, sizeof(msg), "uninstalled: %s (%d remain)", name, n);
+				aiAddHistory(data, msg);
+			} else {
+				aiAddHistory(data, "skill not found");
+			}
+			return 1;
+		}
 		if (!arg || strncmp(arg, "install ", 8) != 0) {
-			aiAddHistory(data, "usage: /skill install <url>");
+			aiAddHistory(data, "usage: /skill install <url>  |  /skill uninstall <name>");
 			return 1;
 		}
 		const char *url = arg + 8;
@@ -7447,45 +8141,208 @@ int hkHandleSlash(aiData *data, const char *prompt) {
 	if (strncmp(cmd, "quit", cmdlen) == 0 && cmdlen == 4) {
 		return 2;
 	}
+	if (strncmp(cmd, "usage", cmdlen) == 0 && cmdlen == 5) {
+		char msg[256];
+		snprintf(msg, sizeof(msg), "provider: %s", hkProviderName(E.ai_provider_type));
+		aiAddHistory(data, msg);
+		snprintf(msg, sizeof(msg), "model:    %s", E.ai_model ? E.ai_model : "(unset)");
+		aiAddHistory(data, msg);
+		snprintf(msg, sizeof(msg), "tools:    %s", E.ai_tools_enabled ? "on" : "off");
+		aiAddHistory(data, msg);
+		snprintf(msg, sizeof(msg), "trust:    %s", hkProjectTrusted() ? "granted" : "not granted");
+		aiAddHistory(data, msg);
+		snprintf(msg, sizeof(msg), "skills:   %d loaded", hkLoadSkills(data));
+		aiAddHistory(data, msg);
+		snprintf(msg, sizeof(msg), "stream:   %s", E.ai_stream ? "on" : "off");
+		aiAddHistory(data, msg);
+		snprintf(msg, sizeof(msg), "session:  %s (%d turns)",
+			E.session_id ? E.session_id : "(none)", E.session_turn_count);
+		aiAddHistory(data, msg);
+		char hpath[PATH_MAX];
+		hkHistoryPath(hpath, sizeof(hpath));
+		snprintf(msg, sizeof(msg), "history:  %s", hpath);
+		aiAddHistory(data, msg);
+		snprintf(msg, sizeof(msg), "tokens:   last %d in / %d out  total %ld in / %ld out (cap %d)",
+			data->last_in_tokens, data->last_out_tokens,
+			data->total_in_tokens, data->total_out_tokens, E.ai_max_tokens);
+		aiAddHistory(data, msg);
+		return 1;
+	}
+	if (strncmp(cmd, "sessions", cmdlen) == 0 && cmdlen == 8) {
+		char path[512];
+		hkHistoryPath(path, sizeof(path));
+		FILE *fp = fopen(path, "r");
+		if (!fp) { aiAddHistory(data, "(no history)"); return 1; }
+		char ids[16][32];
+		long lasts[16];
+		int counts[16];
+		char firsts[16][80];
+		int n = 0;
+		char *line = NULL;
+		size_t cap = 0;
+		while (getline(&line, &cap, fp) != -1) {
+			char *sidp = strstr(line, "\"sid\":\"");
+			if (!sidp) continue;
+			sidp += 7;
+			char *send = strchr(sidp, '"');
+			if (!send) continue;
+			char id[32];
+			int idlen = send - sidp;
+			if (idlen >= (int)sizeof(id)) idlen = sizeof(id) - 1;
+			memcpy(id, sidp, idlen); id[idlen] = '\0';
+			if (!*id) continue;
+			char *tsp = strstr(line, "\"ts\":");
+			long ts = tsp ? atol(tsp + 5) : 0;
+			int idx = -1;
+			for (int i = 0; i < n; i++) if (strcmp(ids[i], id) == 0) { idx = i; break; }
+			if (idx < 0) {
+				if (n >= 16) continue;
+				idx = n++;
+				snprintf(ids[idx], sizeof(ids[idx]), "%s", id);
+				firsts[idx][0] = '\0';
+				counts[idx] = 0;
+				char *role = strstr(line, "\"role\":\"user\"");
+				if (role) {
+					char *cp = strstr(line, "\"content\":\"");
+					if (cp) {
+						cp += 11;
+						int j = 0;
+						while (*cp && *cp != '"' && j < 60) firsts[idx][j++] = *cp++;
+						firsts[idx][j] = '\0';
+					}
+				}
+			}
+			counts[idx]++;
+			lasts[idx] = ts;
+		}
+		free(line); fclose(fp);
+		if (n == 0) { aiAddHistory(data, "(no sessions)"); return 1; }
+		long now = (long)time(NULL);
+		for (int i = 0; i < n; i++) {
+			long age = now - lasts[i];
+			char unit; long val;
+			if (age < 3600) { val = age / 60; unit = 'm'; }
+			else if (age < 86400) { val = age / 3600; unit = 'h'; }
+			else { val = age / 86400; unit = 'd'; }
+			char msg[200];
+			const char *cur = (E.session_id && strcmp(E.session_id, ids[i]) == 0) ? "* " : "  ";
+			snprintf(msg, sizeof(msg), "%s%s %ld%c %dt %.40s", cur, ids[i], val, unit, counts[i], firsts[i]);
+			aiAddHistory(data, msg);
+		}
+		aiAddHistory(data, "(/resume <id> to switch)");
+		return 1;
+	}
+	if (strncmp(cmd, "resume", cmdlen) == 0 && cmdlen == 6) {
+		if (!arg || !*arg) { aiAddHistory(data, "usage: /resume <id>"); return 1; }
+		free(E.session_id);
+		E.session_id = strdup(arg);
+		E.session_resumed = 1;
+		E.session_started = (long)time(NULL);
+		hkSaveSession();
+		for (int i = 0; i < data->history_count; i++) free(data->history[i]);
+		memset(data->history_role, 0, AI_HISTORY_MAX);
+		data->history_count = 0;
+		data->cursor_y = data->history_pos = 0;
+		aiFreeMessages(data);
+		char msg[128];
+		snprintf(msg, sizeof(msg), "resumed: %s", E.session_id);
+		aiAddHistory(data, msg);
+		hkLoadHistoryTail(data, 200);
+		return 1;
+	}
+	if (strncmp(cmd, "session", cmdlen) == 0 && cmdlen == 7) {
+		if (arg && strcmp(arg, "new") == 0) {
+			for (int i = 0; i < data->history_count; i++) free(data->history[i]);
+			memset(data->history_role, 0, AI_HISTORY_MAX);
+			data->history_count = 0;
+			data->cursor_y = data->history_pos = 0;
+			aiFreeMessages(data);
+			E.session_started = (long)time(NULL);
+			E.session_turn_count = 0;
+			E.session_resumed = 0;
+			hkGenSessionId();
+			hkSaveSession();
+			char msg[128];
+			snprintf(msg, sizeof(msg), "new session: %s", E.session_id);
+			aiAddHistory(data, msg);
+			return 1;
+		}
+		char msg[256];
+		snprintf(msg, sizeof(msg), "id:      %s", E.session_id ? E.session_id : "(none)");
+		aiAddHistory(data, msg);
+		long age = (long)time(NULL) - E.session_started;
+		snprintf(msg, sizeof(msg), "started: %ld min ago", age / 60);
+		aiAddHistory(data, msg);
+		snprintf(msg, sizeof(msg), "turns:   %d", E.session_turn_count);
+		aiAddHistory(data, msg);
+		snprintf(msg, sizeof(msg), "state:   %s", E.session_resumed ? "resumed" : "new");
+		aiAddHistory(data, msg);
+		aiAddHistory(data, "(/session new to reset)");
+		return 1;
+	}
 	aiAddHistory(data, "unknown command (/help)");
 	return 1;
 }
 
-void aiAddHistory(aiData *data, const char *text) {
-	if (!data || !text) return;
+static void aiPushHistoryLine(aiData *data, const char *text, int len, unsigned char role) {
+	if (data->history_count >= AI_HISTORY_MAX) return;
+	char *line = malloc(len + 1);
+	if (!line) return;
+	memcpy(line, text, len);
+	line[len] = '\0';
+	data->history_role[data->history_count] = role;
+	data->history[data->history_count++] = line;
+}
 
+static void aiAddHistoryLine(aiData *data, const char *text, int text_len, unsigned char role) {
 	int max_width = 60;
-	int text_len = strlen(text);
-
-	if (text_len <= max_width) {
-		if (data->history_count < AI_HISTORY_MAX) {
-			data->history[data->history_count++] = strdup(text);
-		}
+	if (text_len <= 0) {
+		aiPushHistoryLine(data, "", 0, role);
 		return;
 	}
-
+	if (text_len <= max_width) {
+		aiPushHistoryLine(data, text, text_len, role);
+		return;
+	}
 	int pos = 0;
 	while (pos < text_len) {
 		if (data->history_count >= AI_HISTORY_MAX) break;
-
 		int end = pos + max_width;
 		if (end >= text_len) {
-			data->history[data->history_count++] = strdup(text + pos);
+			aiPushHistoryLine(data, text + pos, text_len - pos, role);
 			break;
 		}
-
 		int wrap = end;
-		while (wrap > pos && text[wrap] != ' ' && text[wrap] != '\n') wrap--;
+		while (wrap > pos && text[wrap] != ' ') wrap--;
 		if (wrap == pos) wrap = end;
-
-		char *line = malloc(wrap - pos + 1);
-		memcpy(line, text + pos, wrap - pos);
-		line[wrap - pos] = '\0';
-		data->history[data->history_count++] = line;
-
+		aiPushHistoryLine(data, text + pos, wrap - pos, role);
 		pos = wrap;
-		while (pos < text_len && (text[pos] == ' ' || text[pos] == '\n')) pos++;
+		while (pos < text_len && text[pos] == ' ') pos++;
 	}
+}
+
+void aiAddHistoryRole(aiData *data, const char *text, unsigned char role) {
+	if (!data || !text) return;
+	if (data->history_count > 0 && data->history_count < AI_HISTORY_MAX - 1) {
+		unsigned char prev = data->history_role[data->history_count - 1];
+		int role_swap = (prev != role) && (prev == HK_ROLE_USER || prev == HK_ROLE_AI || role == HK_ROLE_USER || role == HK_ROLE_AI);
+		char *prev_text = data->history[data->history_count - 1];
+		if (role_swap && prev_text && *prev_text != '\0') {
+			aiPushHistoryLine(data, "", 0, HK_ROLE_SYSTEM);
+		}
+	}
+	const char *p = text;
+	while (1) {
+		const char *nl = strchr(p, '\n');
+		int seg = nl ? (int)(nl - p) : (int)strlen(p);
+		aiAddHistoryLine(data, p, seg, role);
+		if (!nl) break;
+		p = nl + 1;
+	}
+}
+
+void aiAddHistory(aiData *data, const char *text) {
+	aiAddHistoryRole(data, text, HK_ROLE_SYSTEM);
 }
 
 void aiPushMessage(aiData *data, const char *role, const char *content) {
@@ -7578,6 +8435,8 @@ static char *aiWriteRequestFile(const char *json) {
 	return strdup(path);
 }
 
+static char *hkBuildToolsSchema(int provider_format);
+
 char *aiBuildCurlCommand(aiData *data, enum aiProviderType type) {
 	char *msgs = aiBuildMessagesJson(data);
 	if (!msgs) return NULL;
@@ -7599,54 +8458,91 @@ char *aiBuildCurlCommand(aiData *data, enum aiProviderType type) {
 		hkJsonEscapeInto(sys, sys_esc, slen * 6 + 8);
 	}
 
+	int tools_on = E.ai_tools_enabled;
+	char *anth_tools = NULL, *fn_tools = NULL;
+	if (tools_on) {
+		anth_tools = hkBuildToolsSchema(0);
+		fn_tools = hkBuildToolsSchema(1);
+	}
+
 	switch (type) {
-	case AI_PROVIDER_OLLAMA:
+	case AI_PROVIDER_OLLAMA: {
 		if (!endpoint) endpoint = "http://localhost:11434";
 		if (!model) model = "llama3.2";
-		snprintf(body, bodycap,
-			"{\"model\":\"%s\",\"messages\":%s,\"stream\":false}",
-			model, msgs);
-		break;
-	case AI_PROVIDER_ANTHROPIC: {
-		if (!endpoint) endpoint = "https://api.anthropic.com";
-		if (!model) model = "claude-sonnet-4-20250514";
-		const char *tools_json =
-			",\"tools\":["
-			"{\"name\":\"read_file\",\"description\":\"Read contents of a file at the given path.\",\"input_schema\":{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"}},\"required\":[\"path\"]}},"
-			"{\"name\":\"list_dir\",\"description\":\"List entries in a directory.\",\"input_schema\":{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"}},\"required\":[\"path\"]}},"
-			"{\"name\":\"write_file\",\"description\":\"Create or overwrite a file at the given path with the given content. Only permitted inside the trusted project directory.\",\"input_schema\":{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"},\"content\":{\"type\":\"string\"}},\"required\":[\"path\",\"content\"]}},"
-			"{\"name\":\"run_shell\",\"description\":\"Run a non-interactive shell command and return stdout+stderr. 10s timeout.\",\"input_schema\":{\"type\":\"object\",\"properties\":{\"cmd\":{\"type\":\"string\"}},\"required\":[\"cmd\"]}}"
-			"]";
-		int tools_on = E.ai_tools_enabled && hkProjectTrusted();
-		int stream_on = E.ai_stream && !tools_on;
-		int tlen = tools_on ? strlen(tools_json) : 0;
+		int tlen = tools_on ? strlen(fn_tools) + 16 : 0;
 		int need = bodycap + tlen + 96;
 		if (need > bodycap) { body = realloc(body, need); bodycap = need; }
-		const char *stream_field = stream_on ? ",\"stream\":true" : "";
-		if (*sys) {
+		if (tools_on) {
 			snprintf(body, bodycap,
-				"{\"model\":\"%s\",\"max_tokens\":%d,\"system\":\"%s\",\"messages\":%s%s%s}",
-				model, max_tokens, sys_esc, msgs, tools_on ? tools_json : "", stream_field);
+				"{\"model\":\"%s\",\"messages\":%s,\"stream\":false,\"tools\":%s}",
+				model, msgs, fn_tools);
 		} else {
 			snprintf(body, bodycap,
-				"{\"model\":\"%s\",\"max_tokens\":%d,\"messages\":%s%s%s}",
-				model, max_tokens, msgs, tools_on ? tools_json : "", stream_field);
+				"{\"model\":\"%s\",\"messages\":%s,\"stream\":false}",
+				model, msgs);
 		}
 		break;
 	}
-	case AI_PROVIDER_OPENAI:
+	case AI_PROVIDER_ANTHROPIC: {
+		if (!endpoint) endpoint = "https://api.anthropic.com";
+		if (!model) model = "claude-sonnet-4-20250514";
+		int anth_on = tools_on && hkProjectTrusted();
+		int stream_on = E.ai_stream && !anth_on;
+		int tlen = anth_on ? strlen(anth_tools) + 16 : 0;
+		int need = bodycap + tlen + 96;
+		if (need > bodycap) { body = realloc(body, need); bodycap = need; }
+		const char *stream_field = stream_on ? ",\"stream\":true" : "";
+		char tools_field[64];
+		tools_field[0] = '\0';
+		if (*sys) {
+			if (anth_on) {
+				snprintf(body, bodycap,
+					"{\"model\":\"%s\",\"max_tokens\":%d,\"system\":\"%s\",\"messages\":%s,\"tools\":%s%s}",
+					model, max_tokens, sys_esc, msgs, anth_tools, stream_field);
+			} else {
+				snprintf(body, bodycap,
+					"{\"model\":\"%s\",\"max_tokens\":%d,\"system\":\"%s\",\"messages\":%s%s}",
+					model, max_tokens, sys_esc, msgs, stream_field);
+			}
+		} else {
+			if (anth_on) {
+				snprintf(body, bodycap,
+					"{\"model\":\"%s\",\"max_tokens\":%d,\"messages\":%s,\"tools\":%s%s}",
+					model, max_tokens, msgs, anth_tools, stream_field);
+			} else {
+				snprintf(body, bodycap,
+					"{\"model\":\"%s\",\"max_tokens\":%d,\"messages\":%s%s}",
+					model, max_tokens, msgs, stream_field);
+			}
+		}
+		(void)tools_field;
+		break;
+	}
+	case AI_PROVIDER_OPENAI: {
 		if (!endpoint) endpoint = "https://api.openai.com";
 		if (!model) model = "gpt-4o-mini";
-		snprintf(body, bodycap,
-			"{\"model\":\"%s\",\"max_tokens\":%d,\"messages\":%s}",
-			model, max_tokens, msgs);
+		int tlen = tools_on ? strlen(fn_tools) + 16 : 0;
+		int need = bodycap + tlen + 96;
+		if (need > bodycap) { body = realloc(body, need); bodycap = need; }
+		if (tools_on) {
+			snprintf(body, bodycap,
+				"{\"model\":\"%s\",\"max_tokens\":%d,\"messages\":%s,\"tools\":%s}",
+				model, max_tokens, msgs, fn_tools);
+		} else {
+			snprintf(body, bodycap,
+				"{\"model\":\"%s\",\"max_tokens\":%d,\"messages\":%s}",
+				model, max_tokens, msgs);
+		}
 		break;
+	}
 	default:
-		free(body); free(msgs); free(sys_esc); return NULL;
+		free(body); free(msgs); free(sys_esc); free(anth_tools); free(fn_tools); return NULL;
 	}
 
 	free(msgs);
 	free(sys_esc);
+	free(anth_tools);
+	free(fn_tools);
 
 	char *reqfile = aiWriteRequestFile(body);
 	free(body);
@@ -7825,6 +8721,30 @@ static char *hkExtractJsonString(const char *src, const char *key) {
 	return out;
 }
 
+static int hkExtractJsonInt(const char *src, const char *key) {
+	if (!src) return -1;
+	char pat[64];
+	snprintf(pat, sizeof(pat), "\"%s\":", key);
+	const char *p = strstr(src, pat);
+	if (!p) return -1;
+	p += strlen(pat);
+	while (*p == ' ') p++;
+	if (*p < '0' || *p > '9') return -1;
+	return atoi(p);
+}
+
+static void hkUpdateUsage(aiData *data, const char *resp) {
+	if (!data || !resp) return;
+	int in = hkExtractJsonInt(resp, "input_tokens");
+	int out = hkExtractJsonInt(resp, "output_tokens");
+	if (in < 0) in = hkExtractJsonInt(resp, "prompt_tokens");
+	if (out < 0) out = hkExtractJsonInt(resp, "completion_tokens");
+	if (in < 0) in = hkExtractJsonInt(resp, "prompt_eval_count");
+	if (out < 0) out = hkExtractJsonInt(resp, "eval_count");
+	if (in >= 0) { data->last_in_tokens = in; data->total_in_tokens += in; }
+	if (out >= 0) { data->last_out_tokens = out; data->total_out_tokens += out; }
+}
+
 static char *hkExtractJsonObject(const char *src, const char *key) {
 	char pat[64];
 	snprintf(pat, sizeof(pat), "\"%s\":{", key);
@@ -7851,22 +8771,188 @@ static char *hkExtractJsonObject(const char *src, const char *key) {
 	return out;
 }
 
+static int hkResolveInProject(const char *path, char *out_full, size_t out_cap) {
+	if (!path || !*path) return -1;
+	char cwd[PATH_MAX];
+	if (!getcwd(cwd, sizeof(cwd))) return -1;
+	char resolved[PATH_MAX];
+	char parent[PATH_MAX];
+	snprintf(parent, sizeof(parent), "%s", path);
+	char *slash = strrchr(parent, '/');
+	const char *filename_part = NULL;
+	if (slash) {
+		*slash = '\0';
+		filename_part = slash + 1;
+		if (!realpath(parent[0] ? parent : ".", resolved)) return -1;
+	} else {
+		strncpy(resolved, cwd, sizeof(resolved));
+		resolved[sizeof(resolved) - 1] = '\0';
+		filename_part = path;
+	}
+	int cwd_len = strlen(cwd);
+	if (strncmp(resolved, cwd, cwd_len) != 0 ||
+		(resolved[cwd_len] != '\0' && resolved[cwd_len] != '/')) return -1;
+	if (filename_part && *filename_part)
+		snprintf(out_full, out_cap, "%s/%s", resolved, filename_part);
+	else
+		snprintf(out_full, out_cap, "%s", resolved);
+	return 0;
+}
+
+static char *hkReadOpenFile(const char *path) {
+	if (!path) return NULL;
+	editorPane **panes = NULL;
+	int count = 0;
+	editorCollectLeafPanes(E.root_pane, &panes, &count);
+	char *out = NULL;
+	for (int i = 0; i < count; i++) {
+		editorPane *p = panes[i];
+		if (p->type != PANE_EDITOR || !p->filename) continue;
+		const char *f = p->filename;
+		const char *slash = strrchr(f, '/');
+		const char *base = slash ? slash + 1 : f;
+		if (strcmp(f, path) == 0 || strcmp(base, path) == 0) {
+			size_t total = 0;
+			for (int r = 0; r < p->numrows; r++) total += p->row[r].size + 1;
+			out = malloc(total + 1);
+			size_t off = 0;
+			for (int r = 0; r < p->numrows; r++) {
+				memcpy(out + off, p->row[r].chars, p->row[r].size);
+				off += p->row[r].size;
+				out[off++] = '\n';
+			}
+			out[off] = '\0';
+			break;
+		}
+	}
+	free(panes);
+	return out;
+}
+
+static char *hkListOpenFiles(void) {
+	editorPane **panes = NULL;
+	int count = 0;
+	editorCollectLeafPanes(E.root_pane, &panes, &count);
+	size_t cap = 256, len = 0;
+	char *out = malloc(cap);
+	out[0] = '\0';
+	for (int i = 0; i < count; i++) {
+		editorPane *p = panes[i];
+		if (p->type != PANE_EDITOR || !p->filename) continue;
+		size_t fl = strlen(p->filename);
+		if (len + fl + 16 >= cap) { cap = (len + fl + 16) * 2; out = realloc(out, cap); }
+		len += snprintf(out + len, cap - len, "%s%s", p->filename, p->dirty ? " (modified)\n" : "\n");
+	}
+	free(panes);
+	if (len == 0) { free(out); return strdup("(no files open)"); }
+	return out;
+}
+
+typedef struct hkToolDef {
+	const char *name;
+	const char *description;
+	const char *props;
+	const char *required;
+} hkToolDef;
+
+static const hkToolDef HK_TOOLS[] = {
+	{"read_file",
+	 "Read contents of a file inside the project directory.",
+	 "\"path\":{\"type\":\"string\"}",
+	 "\"path\""},
+	{"list_dir",
+	 "List entries in a directory inside the project.",
+	 "\"path\":{\"type\":\"string\"}",
+	 "\"path\""},
+	{"list_open_files",
+	 "List files currently open in editor panes (with modification status).",
+	 "",
+	 ""},
+	{"read_open_file",
+	 "Read live (possibly unsaved) buffer of a file open in an editor pane. Match by full path or basename.",
+	 "\"path\":{\"type\":\"string\"}",
+	 "\"path\""},
+	{"write_file",
+	 "Create or overwrite a file in the trusted project directory.",
+	 "\"path\":{\"type\":\"string\"},\"content\":{\"type\":\"string\"}",
+	 "\"path\",\"content\""},
+	{"run_shell",
+	 "Run a non-interactive shell command. 10s timeout. Requires project trust.",
+	 "\"cmd\":{\"type\":\"string\"}",
+	 "\"cmd\""},
+};
+static const int HK_TOOL_COUNT = sizeof(HK_TOOLS) / sizeof(HK_TOOLS[0]);
+
+static char *hkBuildToolsSchema(int provider_format) {
+	size_t cap = 4096, len = 0;
+	char *out = malloc(cap);
+	out[len++] = '[';
+	for (int i = 0; i < HK_TOOL_COUNT; i++) {
+		const hkToolDef *t = &HK_TOOLS[i];
+		if (i > 0) { if (len + 1 >= cap) { cap *= 2; out = realloc(out, cap); } out[len++] = ','; }
+		size_t need = len + strlen(t->name) + strlen(t->description) + strlen(t->props) + strlen(t->required) + 256;
+		if (need >= cap) { while (cap < need) cap *= 2; out = realloc(out, cap); }
+		const char *props = t->props;
+		const char *req_close = (*t->required) ? "],\"required\":[" : "";
+		const char *req_close_end = (*t->required) ? "]" : "";
+		if (provider_format == 0) {
+			len += snprintf(out + len, cap - len,
+				"{\"name\":\"%s\",\"description\":\"%s\",\"input_schema\":{\"type\":\"object\",\"properties\":{%s}%s%s%s}}",
+				t->name, t->description, props,
+				(*t->required) ? ",\"required\":[" : "",
+				t->required, req_close_end);
+		} else {
+			len += snprintf(out + len, cap - len,
+				"{\"type\":\"function\",\"function\":{\"name\":\"%s\",\"description\":\"%s\",\"parameters\":{\"type\":\"object\",\"properties\":{%s}%s%s%s}}}",
+				t->name, t->description, props,
+				(*t->required) ? ",\"required\":[" : "",
+				t->required, req_close_end);
+		}
+		(void)req_close;
+	}
+	if (len + 2 >= cap) { cap += 4; out = realloc(out, cap); }
+	out[len++] = ']';
+	out[len] = '\0';
+	return out;
+}
+
 static char *hkExecTool(const char *name, const char *input_json) {
 	if (strcmp(name, "read_file") == 0) {
 		char *path = hkExtractJsonString(input_json, "path");
 		if (!path) return strdup("error: missing path");
-		char *c = hkReadFileAll(path, 100000);
+		char full[PATH_MAX];
+		if (hkResolveInProject(path, full, sizeof(full)) != 0) {
+			free(path);
+			return strdup("error: path outside project");
+		}
 		free(path);
+		char *c = hkReadFileAll(full, 100000);
 		return c ? c : strdup("error: cannot read");
 	}
 	if (strcmp(name, "list_dir") == 0) {
 		char *path = hkExtractJsonString(input_json, "path");
 		if (!path) return strdup("error: missing path");
-		char *c = hkListDir(path);
+		char full[PATH_MAX];
+		if (hkResolveInProject(path, full, sizeof(full)) != 0) {
+			free(path);
+			return strdup("error: path outside project");
+		}
 		free(path);
+		char *c = hkListDir(full);
 		return c ? c : strdup("error: cannot list");
 	}
+	if (strcmp(name, "read_open_file") == 0) {
+		char *path = hkExtractJsonString(input_json, "path");
+		if (!path) return strdup("error: missing path");
+		char *c = hkReadOpenFile(path);
+		free(path);
+		return c ? c : strdup("error: file not open in any editor pane");
+	}
+	if (strcmp(name, "list_open_files") == 0) {
+		return hkListOpenFiles();
+	}
 	if (strcmp(name, "run_shell") == 0) {
+		if (!hkProjectTrusted()) return strdup("error: project not trusted");
 		char *shcmd = hkExtractJsonString(input_json, "cmd");
 		if (!shcmd) return strdup("error: missing cmd");
 		char *c = hkRunShellCapture(shcmd, 50000);
@@ -7881,48 +8967,55 @@ static char *hkExecTool(const char *name, const char *input_json) {
 			free(path); free(content);
 			return strdup("error: missing path or content");
 		}
-		char cwd[PATH_MAX];
-		if (!getcwd(cwd, sizeof(cwd))) {
-			free(path); free(content);
-			return strdup("error: cwd unavailable");
-		}
-		char resolved[PATH_MAX];
-		char parent[PATH_MAX];
-		snprintf(parent, sizeof(parent), "%s", path);
-		char *slash = strrchr(parent, '/');
-		char *filename_part = NULL;
-		if (slash) {
-			*slash = '\0';
-			filename_part = slash + 1;
-			char *rp = realpath(parent[0] ? parent : ".", resolved);
-			if (!rp) { free(path); free(content); return strdup("error: bad directory"); }
-		} else {
-			strncpy(resolved, cwd, sizeof(resolved));
-			resolved[sizeof(resolved) - 1] = '\0';
-			filename_part = (char *)path;
-		}
-		int cwd_len = strlen(cwd);
-		if (strncmp(resolved, cwd, cwd_len) != 0 ||
-			(resolved[cwd_len] != '\0' && resolved[cwd_len] != '/')) {
+		char full[PATH_MAX];
+		if (hkResolveInProject(path, full, sizeof(full)) != 0) {
 			free(path); free(content);
 			return strdup("error: path outside trusted project");
 		}
-		char full[PATH_MAX];
-		snprintf(full, sizeof(full), "%s/%s", resolved, filename_part ? filename_part : "");
+		size_t clen = strlen(content);
+		int new_lines = 0;
+		for (size_t i = 0; i < clen; i++) if (content[i] == '\n') new_lines++;
+		if (clen > 0 && content[clen - 1] != '\n') new_lines++;
+		long old_size = -1;
+		int old_lines = 0;
+		FILE *ef = fopen(full, "r");
+		if (ef) {
+			fseek(ef, 0, SEEK_END);
+			old_size = ftell(ef);
+			fseek(ef, 0, SEEK_SET);
+			int ch;
+			while ((ch = fgetc(ef)) != EOF) if (ch == '\n') old_lines++;
+			fclose(ef);
+		}
+		if (!E.ai_autowrite) {
+			char pending[PATH_MAX + 16];
+			snprintf(pending, sizeof(pending), "%s.hako-pending", full);
+			FILE *fp = fopen(pending, "w");
+			if (!fp) { free(path); free(content); return strdup("error: cannot stage pending"); }
+			fwrite(content, 1, clen, fp);
+			fclose(fp);
+			char *out = malloc(512);
+			snprintf(out, 512, "preview staged at %s (new %zu bytes/%d lines, old %ld/%d). ai_autowrite=0; user must `mv` pending to apply.",
+				pending, clen, new_lines, old_size, old_lines);
+			free(path); free(content);
+			return out;
+		}
 		FILE *fp = fopen(full, "w");
 		if (!fp) { free(path); free(content); return strdup("error: cannot open for write"); }
-		size_t clen = strlen(content);
 		size_t wrote = fwrite(content, 1, clen, fp);
 		fclose(fp);
 		char *out = malloc(256);
-		snprintf(out, 256, "wrote %zu bytes to %s", wrote, full);
+		snprintf(out, 256, "wrote %zu bytes to %s (new %d lines, old %d)", wrote, full, new_lines, old_lines);
 		free(path); free(content);
 		return out;
 	}
 	return strdup("error: unknown tool");
 }
 
-static char *hkBuildToolResults(const char *content_array) {
+static void hkAnnounceTool(aiData *data, const char *fname, const char *args_obj);
+static void hkAnnounceToolResult(aiData *data, const char *result);
+
+static char *hkBuildToolResults(aiData *data, const char *content_array) {
 	char *out = malloc(32);
 	int cap = 32, len = 0;
 	out[0] = '[';
@@ -7939,7 +9032,9 @@ static char *hkBuildToolResults(const char *content_array) {
 			free(id); free(name); free(input_obj);
 			p++; continue;
 		}
+		hkAnnounceTool(data, name, input_obj);
 		char *result = hkExecTool(name, input_obj);
+		hkAnnounceToolResult(data, result);
 		int rlen = strlen(result);
 		char *esc = malloc(rlen * 6 + 8);
 		hkJsonEscapeInto(result, esc, rlen * 6 + 8);
@@ -7957,6 +9052,60 @@ static char *hkBuildToolResults(const char *content_array) {
 	out[len++] = ']';
 	out[len] = '\0';
 	return out;
+}
+
+static void hkAnnounceTool(aiData *data, const char *fname, const char *args_obj) {
+	char arg_summary[128] = "";
+	char *path = hkExtractJsonString(args_obj, "path");
+	char *cmd = hkExtractJsonString(args_obj, "cmd");
+	if (path) { snprintf(arg_summary, sizeof(arg_summary), "%s", path); free(path); }
+	else if (cmd) { snprintf(arg_summary, sizeof(arg_summary), "%.80s", cmd); free(cmd); }
+	char msg[256];
+	snprintf(msg, sizeof(msg), "→ %s(%s)", fname, arg_summary);
+	pthread_mutex_lock(&data->lock);
+	aiAddHistory(data, msg);
+	pthread_mutex_unlock(&data->lock);
+}
+
+static void hkAnnounceToolResult(aiData *data, const char *result) {
+	int len = result ? (int)strlen(result) : 0;
+	int is_err = result && strncmp(result, "error:", 6) == 0;
+	char msg[128];
+	if (is_err) snprintf(msg, sizeof(msg), "  %s", result);
+	else snprintf(msg, sizeof(msg), "  ← %d bytes", len);
+	pthread_mutex_lock(&data->lock);
+	aiAddHistory(data, msg);
+	pthread_mutex_unlock(&data->lock);
+}
+
+static char *hkJsonUnescape(const char *s, int n);
+
+static int hkFnToolExecAll(aiData *data, const char *response) {
+	const char *p = strstr(response, "\"tool_calls\":[");
+	if (!p) return 0;
+	int count = 0;
+	while ((p = strstr(p, "\"function\""))) {
+		char *fname = hkExtractJsonString(p, "name");
+		char *args_obj = hkExtractJsonObject(p, "arguments");
+		if (!args_obj) {
+			char *args_str = hkExtractJsonString(p, "arguments");
+			if (args_str) {
+				args_obj = hkJsonUnescape(args_str, (int)strlen(args_str));
+				free(args_str);
+			}
+		}
+		if (!fname || !args_obj) { free(fname); free(args_obj); p++; continue; }
+		hkAnnounceTool(data, fname, args_obj);
+		char *result = hkExecTool(fname, args_obj);
+		hkAnnounceToolResult(data, result);
+		pthread_mutex_lock(&data->lock);
+		aiPushMessage(data, "tool", result ? result : "");
+		pthread_mutex_unlock(&data->lock);
+		free(fname); free(args_obj); free(result);
+		count++;
+		p++;
+	}
+	return count;
 }
 
 static char *hkExtractContentArray(const char *response) {
@@ -8029,6 +9178,7 @@ void *aiWorkerThread(void *arg) {
 			pthread_mutex_lock(&data->lock);
 			int stream_idx = data->history_count;
 			if (stream_idx < AI_HISTORY_MAX) {
+				data->history_role[stream_idx] = HK_ROLE_AI;
 				data->history[stream_idx] = strdup("");
 				data->history_count++;
 			} else {
@@ -8061,7 +9211,11 @@ void *aiWorkerThread(void *arg) {
 				if (stream_idx >= 0) {
 					pthread_mutex_lock(&data->lock);
 					free(data->history[stream_idx]);
-					data->history[stream_idx] = strdup(acc);
+					char *disp = strdup(acc);
+					if (disp) {
+						for (char *q = disp; *q; q++) if (*q == '\n') *q = ' ';
+					}
+					data->history[stream_idx] = disp;
 					data->history_pos = MAX(0, data->history_count - 20);
 					pthread_mutex_unlock(&data->lock);
 				}
@@ -8071,6 +9225,14 @@ void *aiWorkerThread(void *arg) {
 
 			if (acc_len > 0) {
 				pthread_mutex_lock(&data->lock);
+				hkUpdateUsage(data, full_response);
+				if (stream_idx >= 0 && stream_idx == data->history_count - 1) {
+					free(data->history[stream_idx]);
+					data->history[stream_idx] = NULL;
+					data->history_count--;
+					aiAddHistoryRole(data, acc, HK_ROLE_AI);
+					data->history_pos = MAX(0, data->history_count - 20);
+				}
 				aiPushMessage(data, "assistant", acc);
 				hkLogMessage("assistant", acc);
 				free(data->current_response);
@@ -8096,22 +9258,26 @@ void *aiWorkerThread(void *arg) {
 		pclose(fp);
 		if (full_response) full_response[total] = '\0';
 
-		int tool_use = E.ai_provider_type == AI_PROVIDER_ANTHROPIC
+		int tool_use_anthropic = E.ai_provider_type == AI_PROVIDER_ANTHROPIC
 			&& full_response
 			&& strstr(full_response, "\"stop_reason\":\"tool_use\"");
+		int tool_use_fn = (E.ai_provider_type == AI_PROVIDER_OLLAMA || E.ai_provider_type == AI_PROVIDER_OPENAI)
+			&& full_response
+			&& strstr(full_response, "\"tool_calls\":[");
 
 		char *content = aiExtractResponse(full_response, E.ai_provider_type);
 
 		pthread_mutex_lock(&data->lock);
+		hkUpdateUsage(data, full_response);
 		if (content && *content) {
-			aiAddHistory(data, content);
+			aiAddHistoryRole(data, content, HK_ROLE_AI);
 			hkLogMessage("assistant", content);
 			free(data->current_response);
 			data->current_response = strdup(content);
 		}
 		pthread_mutex_unlock(&data->lock);
 
-		if (tool_use) {
+		if (tool_use_anthropic) {
 			char *content_array = hkExtractContentArray(full_response);
 			if (!content_array) { free(content); free(full_response); break; }
 
@@ -8119,17 +9285,31 @@ void *aiWorkerThread(void *arg) {
 			aiPushMessageRaw(data, "assistant", content_array);
 			pthread_mutex_unlock(&data->lock);
 
-			char *results = hkBuildToolResults(content_array);
+			char *results = hkBuildToolResults(data, content_array);
 
 			pthread_mutex_lock(&data->lock);
 			aiPushMessageRaw(data, "user", results);
-			aiAddHistory(data, "(tool exec)");
 			pthread_mutex_unlock(&data->lock);
 
 			free(content_array);
 			free(results);
 			free(content);
 			free(full_response);
+			used_tool = 1;
+			continue;
+		}
+
+		if (tool_use_fn) {
+			pthread_mutex_lock(&data->lock);
+			aiPushMessage(data, "assistant", content && *content ? content : "(calling tools)");
+			pthread_mutex_unlock(&data->lock);
+
+			int n = hkFnToolExecAll(data, full_response);
+			(void)n;
+
+			free(content);
+			free(full_response);
+			if (n == 0) break;
 			used_tool = 1;
 			continue;
 		}
@@ -8269,10 +9449,6 @@ void editorGenerateConfig() {
 	fprintf(fp, "# SSE token streaming. Auto-disabled when tools are on.\n");
 	fprintf(fp, "ai_stream=1\n\n");
 
-	fprintf(fp, "# Mascot ASCII art file. Blank = built-in lucky cat.\n");
-	fprintf(fp, "# Example: ai_mascot=~/.hako/mascots/neko.txt\n");
-	fprintf(fp, "ai_mascot=\n\n");
-
 	fprintf(fp, "# ============================================================\n");
 	fprintf(fp, "#  Theme preset\n");
 	fprintf(fp, "# ============================================================\n");
@@ -8339,6 +9515,271 @@ void editorGenerateConfig() {
 }
 
 /*** init ***/
+int editorApplyThemeByName(const char *name) {
+	if (!name) return 0;
+	if (strcmp(name, "dark") == 0) {
+		E.theme_preset = THEME_DARK;
+		E.theme.bg = (Color){30, 30, 30};
+		E.theme.fg = (Color){212, 212, 212};
+		E.theme.comment = (Color){106, 153, 85};
+		E.theme.keyword1 = (Color){86, 156, 214};
+		E.theme.keyword2 = (Color){78, 201, 176};
+		E.theme.string = (Color){206, 145, 120};
+		E.theme.number = (Color){181, 206, 168};
+		E.theme.line_number = (Color){133, 133, 133};
+		E.theme.status_bg = (Color){50, 50, 50};
+		E.theme.status_fg = (Color){212, 212, 212};
+		E.theme.border = (Color){80, 80, 80};
+		E.theme.visual_bg = (Color){38, 79, 120};
+		E.theme.visual_fg = (Color){255, 255, 255};
+	} else if (strcmp(name, "light") == 0) {
+		E.theme_preset = THEME_LIGHT;
+		E.theme.bg = (Color){255, 255, 255};
+		E.theme.fg = (Color){30, 30, 30};
+		E.theme.comment = (Color){0, 128, 0};
+		E.theme.keyword1 = (Color){0, 0, 200};
+		E.theme.keyword2 = (Color){0, 128, 128};
+		E.theme.string = (Color){163, 21, 21};
+		E.theme.number = (Color){9, 134, 88};
+		E.theme.line_number = (Color){150, 150, 150};
+		E.theme.status_bg = (Color){220, 220, 220};
+		E.theme.status_fg = (Color){30, 30, 30};
+		E.theme.border = (Color){180, 180, 180};
+		E.theme.visual_bg = (Color){173, 214, 255};
+		E.theme.visual_fg = (Color){0, 0, 0};
+	} else if (strcmp(name, "gruvbox") == 0) {
+		E.theme_preset = THEME_GRUVBOX;
+		E.theme.bg = (Color){40, 40, 40};
+		E.theme.fg = (Color){235, 219, 178};
+		E.theme.comment = (Color){146, 131, 116};
+		E.theme.keyword1 = (Color){251, 73, 52};
+		E.theme.keyword2 = (Color){184, 187, 38};
+		E.theme.string = (Color){184, 187, 38};
+		E.theme.number = (Color){211, 134, 155};
+		E.theme.line_number = (Color){124, 111, 100};
+		E.theme.status_bg = (Color){80, 73, 69};
+		E.theme.status_fg = (Color){235, 219, 178};
+		E.theme.border = (Color){80, 73, 69};
+		E.theme.visual_bg = (Color){68, 65, 59};
+		E.theme.visual_fg = (Color){235, 219, 178};
+	} else if (strcmp(name, "nord") == 0) {
+		E.theme_preset = THEME_NORD;
+		E.theme.bg = (Color){46, 52, 64};
+		E.theme.fg = (Color){216, 222, 233};
+		E.theme.comment = (Color){76, 86, 106};
+		E.theme.keyword1 = (Color){129, 161, 193};
+		E.theme.keyword2 = (Color){136, 192, 208};
+		E.theme.string = (Color){163, 190, 140};
+		E.theme.number = (Color){180, 142, 173};
+		E.theme.line_number = (Color){76, 86, 106};
+		E.theme.status_bg = (Color){59, 66, 82};
+		E.theme.status_fg = (Color){216, 222, 233};
+		E.theme.border = (Color){59, 66, 82};
+		E.theme.visual_bg = (Color){67, 76, 94};
+		E.theme.visual_fg = (Color){216, 222, 233};
+	} else if (strcmp(name, "dracula") == 0) {
+		E.theme_preset = THEME_DRACULA;
+		E.theme.bg = (Color){40, 42, 54};
+		E.theme.fg = (Color){248, 248, 242};
+		E.theme.comment = (Color){98, 114, 164};
+		E.theme.keyword1 = (Color){255, 121, 198};
+		E.theme.keyword2 = (Color){139, 233, 253};
+		E.theme.string = (Color){241, 250, 140};
+		E.theme.number = (Color){189, 147, 249};
+		E.theme.line_number = (Color){98, 114, 164};
+		E.theme.status_bg = (Color){68, 71, 90};
+		E.theme.status_fg = (Color){248, 248, 242};
+		E.theme.border = (Color){68, 71, 90};
+		E.theme.visual_bg = (Color){68, 71, 90};
+		E.theme.visual_fg = (Color){248, 248, 242};
+	} else if (strcmp(name, "monokai") == 0) {
+		E.theme_preset = THEME_MONOKAI;
+		E.theme.bg = (Color){39, 40, 34};
+		E.theme.fg = (Color){248, 248, 242};
+		E.theme.comment = (Color){117, 113, 94};
+		E.theme.keyword1 = (Color){249, 38, 114};
+		E.theme.keyword2 = (Color){102, 217, 239};
+		E.theme.string = (Color){230, 219, 116};
+		E.theme.number = (Color){174, 129, 255};
+		E.theme.line_number = (Color){117, 113, 94};
+		E.theme.status_bg = (Color){60, 61, 55};
+		E.theme.status_fg = (Color){248, 248, 242};
+		E.theme.border = (Color){60, 61, 55};
+		E.theme.visual_bg = (Color){73, 72, 62};
+		E.theme.visual_fg = (Color){248, 248, 242};
+	} else if (strcmp(name, "solarized") == 0) {
+		E.theme_preset = THEME_SOLARIZED;
+		E.theme.bg = (Color){0, 43, 54};
+		E.theme.fg = (Color){131, 148, 150};
+		E.theme.comment = (Color){88, 110, 117};
+		E.theme.keyword1 = (Color){38, 139, 210};
+		E.theme.keyword2 = (Color){42, 161, 152};
+		E.theme.string = (Color){42, 161, 152};
+		E.theme.number = (Color){211, 54, 130};
+		E.theme.line_number = (Color){88, 110, 117};
+		E.theme.status_bg = (Color){7, 54, 66};
+		E.theme.status_fg = (Color){147, 161, 161};
+		E.theme.border = (Color){7, 54, 66};
+		E.theme.visual_bg = (Color){7, 54, 66};
+		E.theme.visual_fg = (Color){147, 161, 161};
+	} else if (strcmp(name, "tokyonight") == 0) {
+		E.theme_preset = THEME_TOKYONIGHT;
+		E.theme.bg = (Color){26, 27, 38};
+		E.theme.fg = (Color){192, 202, 245};
+		E.theme.comment = (Color){86, 95, 137};
+		E.theme.keyword1 = (Color){187, 154, 247};
+		E.theme.keyword2 = (Color){125, 207, 255};
+		E.theme.string = (Color){158, 206, 106};
+		E.theme.number = (Color){255, 158, 100};
+		E.theme.line_number = (Color){60, 68, 102};
+		E.theme.status_bg = (Color){36, 40, 59};
+		E.theme.status_fg = (Color){192, 202, 245};
+		E.theme.border = (Color){60, 68, 102};
+		E.theme.visual_bg = (Color){40, 52, 87};
+		E.theme.visual_fg = (Color){192, 202, 245};
+	} else if (strcmp(name, "catppuccin") == 0) {
+		E.theme_preset = THEME_CATPPUCCIN;
+		E.theme.bg = (Color){30, 30, 46};
+		E.theme.fg = (Color){205, 214, 244};
+		E.theme.comment = (Color){108, 112, 134};
+		E.theme.keyword1 = (Color){203, 166, 247};
+		E.theme.keyword2 = (Color){137, 220, 235};
+		E.theme.string = (Color){166, 227, 161};
+		E.theme.number = (Color){250, 179, 135};
+		E.theme.line_number = (Color){88, 91, 112};
+		E.theme.status_bg = (Color){49, 50, 68};
+		E.theme.status_fg = (Color){205, 214, 244};
+		E.theme.border = (Color){69, 71, 90};
+		E.theme.visual_bg = (Color){69, 71, 90};
+		E.theme.visual_fg = (Color){205, 214, 244};
+	} else if (strcmp(name, "onedark") == 0) {
+		E.theme_preset = THEME_ONEDARK;
+		E.theme.bg = (Color){40, 44, 52};
+		E.theme.fg = (Color){171, 178, 191};
+		E.theme.comment = (Color){92, 99, 112};
+		E.theme.keyword1 = (Color){198, 120, 221};
+		E.theme.keyword2 = (Color){86, 182, 194};
+		E.theme.string = (Color){152, 195, 121};
+		E.theme.number = (Color){209, 154, 102};
+		E.theme.line_number = (Color){76, 82, 99};
+		E.theme.status_bg = (Color){33, 37, 43};
+		E.theme.status_fg = (Color){171, 178, 191};
+		E.theme.border = (Color){60, 64, 72};
+		E.theme.visual_bg = (Color){62, 68, 81};
+		E.theme.visual_fg = (Color){220, 223, 228};
+	} else if (strcmp(name, "material") == 0) {
+		E.theme_preset = THEME_MATERIAL;
+		E.theme.bg = (Color){38, 50, 56};
+		E.theme.fg = (Color){238, 255, 255};
+		E.theme.comment = (Color){84, 110, 122};
+		E.theme.keyword1 = (Color){199, 146, 234};
+		E.theme.keyword2 = (Color){130, 170, 255};
+		E.theme.string = (Color){195, 232, 141};
+		E.theme.number = (Color){247, 140, 108};
+		E.theme.line_number = (Color){63, 81, 88};
+		E.theme.status_bg = (Color){32, 43, 48};
+		E.theme.status_fg = (Color){238, 255, 255};
+		E.theme.border = (Color){63, 81, 88};
+		E.theme.visual_bg = (Color){51, 71, 79};
+		E.theme.visual_fg = (Color){238, 255, 255};
+	} else if (strcmp(name, "everforest") == 0) {
+		E.theme_preset = THEME_EVERFOREST;
+		E.theme.bg = (Color){45, 53, 59};
+		E.theme.fg = (Color){211, 198, 170};
+		E.theme.comment = (Color){133, 146, 137};
+		E.theme.keyword1 = (Color){230, 126, 128};
+		E.theme.keyword2 = (Color){127, 187, 179};
+		E.theme.string = (Color){167, 192, 128};
+		E.theme.number = (Color){219, 188, 127};
+		E.theme.line_number = (Color){86, 99, 98};
+		E.theme.status_bg = (Color){55, 63, 68};
+		E.theme.status_fg = (Color){211, 198, 170};
+		E.theme.border = (Color){67, 76, 81};
+		E.theme.visual_bg = (Color){67, 76, 81};
+		E.theme.visual_fg = (Color){211, 198, 170};
+	} else if (strcmp(name, "rosepine") == 0) {
+		E.theme_preset = THEME_ROSEPINE;
+		E.theme.bg = (Color){25, 23, 36};
+		E.theme.fg = (Color){224, 222, 244};
+		E.theme.comment = (Color){110, 106, 134};
+		E.theme.keyword1 = (Color){196, 167, 231};
+		E.theme.keyword2 = (Color){156, 207, 216};
+		E.theme.string = (Color){246, 193, 119};
+		E.theme.number = (Color){235, 188, 186};
+		E.theme.line_number = (Color){82, 79, 103};
+		E.theme.status_bg = (Color){38, 35, 58};
+		E.theme.status_fg = (Color){224, 222, 244};
+		E.theme.border = (Color){49, 46, 73};
+		E.theme.visual_bg = (Color){64, 61, 82};
+		E.theme.visual_fg = (Color){224, 222, 244};
+	} else if (strcmp(name, "github-dark") == 0) {
+		E.theme_preset = THEME_GITHUB_DARK;
+		E.theme.bg = (Color){13, 17, 23};
+		E.theme.fg = (Color){201, 209, 217};
+		E.theme.comment = (Color){139, 148, 158};
+		E.theme.keyword1 = (Color){255, 123, 114};
+		E.theme.keyword2 = (Color){121, 192, 255};
+		E.theme.string = (Color){165, 214, 255};
+		E.theme.number = (Color){121, 192, 255};
+		E.theme.line_number = (Color){72, 79, 88};
+		E.theme.status_bg = (Color){22, 27, 34};
+		E.theme.status_fg = (Color){201, 209, 217};
+		E.theme.border = (Color){48, 54, 61};
+		E.theme.visual_bg = (Color){33, 38, 45};
+		E.theme.visual_fg = (Color){201, 209, 217};
+	} else if (strcmp(name, "github-light") == 0) {
+		E.theme_preset = THEME_GITHUB_LIGHT;
+		E.theme.bg = (Color){255, 255, 255};
+		E.theme.fg = (Color){36, 41, 47};
+		E.theme.comment = (Color){106, 115, 125};
+		E.theme.keyword1 = (Color){207, 34, 46};
+		E.theme.keyword2 = (Color){5, 80, 174};
+		E.theme.string = (Color){10, 48, 105};
+		E.theme.number = (Color){5, 80, 174};
+		E.theme.line_number = (Color){140, 149, 159};
+		E.theme.status_bg = (Color){240, 246, 252};
+		E.theme.status_fg = (Color){36, 41, 47};
+		E.theme.border = (Color){208, 215, 222};
+		E.theme.visual_bg = (Color){221, 244, 255};
+		E.theme.visual_fg = (Color){36, 41, 47};
+	} else if (strcmp(name, "ayu") == 0) {
+		E.theme_preset = THEME_AYU;
+		E.theme.bg = (Color){15, 20, 25};
+		E.theme.fg = (Color){191, 189, 182};
+		E.theme.comment = (Color){92, 103, 115};
+		E.theme.keyword1 = (Color){255, 143, 64};
+		E.theme.keyword2 = (Color){57, 186, 230};
+		E.theme.string = (Color){170, 217, 76};
+		E.theme.number = (Color){215, 155, 255};
+		E.theme.line_number = (Color){60, 75, 90};
+		E.theme.status_bg = (Color){20, 25, 31};
+		E.theme.status_fg = (Color){191, 189, 182};
+		E.theme.border = (Color){38, 48, 59};
+		E.theme.visual_bg = (Color){38, 48, 59};
+		E.theme.visual_fg = (Color){191, 189, 182};
+	} else if (strcmp(name, "kanagawa") == 0) {
+		E.theme_preset = THEME_KANAGAWA;
+		E.theme.bg = (Color){31, 31, 40};
+		E.theme.fg = (Color){220, 215, 186};
+		E.theme.comment = (Color){114, 113, 105};
+		E.theme.keyword1 = (Color){149, 127, 184};
+		E.theme.keyword2 = (Color){127, 180, 202};
+		E.theme.string = (Color){152, 187, 108};
+		E.theme.number = (Color){210, 126, 153};
+		E.theme.line_number = (Color){84, 84, 109};
+		E.theme.status_bg = (Color){42, 42, 55};
+		E.theme.status_fg = (Color){220, 215, 186};
+		E.theme.border = (Color){54, 54, 70};
+		E.theme.visual_bg = (Color){43, 57, 63};
+		E.theme.visual_fg = (Color){220, 215, 186};
+	} else {
+		return 0;
+	}
+	gridInvalidateFront();
+	E.full_redraw_pending = 1;
+	return 1;
+}
+
 void initTheme() {
 	E.theme.bg = (Color){30, 30, 30};
 	E.theme.fg = (Color){212, 212, 212};
@@ -8441,251 +9882,9 @@ void editorLoadConfig() {
 		} else if (strcmp(key, "explorer_show_hidden") == 0) {
 			E.explorer_show_hidden = atoi(val);
 		} else if (strcmp(key, "theme") == 0) {
-			if (strcmp(val, "light") == 0) {
-				E.theme_preset = THEME_LIGHT;
-				E.theme.bg = (Color){255, 255, 255};
-				E.theme.fg = (Color){30, 30, 30};
-				E.theme.comment = (Color){0, 128, 0};
-				E.theme.keyword1 = (Color){0, 0, 200};
-				E.theme.keyword2 = (Color){0, 128, 128};
-				E.theme.string = (Color){163, 21, 21};
-				E.theme.number = (Color){9, 134, 88};
-				E.theme.line_number = (Color){150, 150, 150};
-				E.theme.status_bg = (Color){220, 220, 220};
-				E.theme.status_fg = (Color){30, 30, 30};
-				E.theme.border = (Color){180, 180, 180};
-				E.theme.visual_bg = (Color){173, 214, 255};
-				E.theme.visual_fg = (Color){0, 0, 0};
-			} else if (strcmp(val, "gruvbox") == 0) {
-				E.theme_preset = THEME_GRUVBOX;
-				E.theme.bg = (Color){40, 40, 40};
-				E.theme.fg = (Color){235, 219, 178};
-				E.theme.comment = (Color){146, 131, 116};
-				E.theme.keyword1 = (Color){251, 73, 52};
-				E.theme.keyword2 = (Color){184, 187, 38};
-				E.theme.string = (Color){184, 187, 38};
-				E.theme.number = (Color){211, 134, 155};
-				E.theme.line_number = (Color){124, 111, 100};
-				E.theme.status_bg = (Color){80, 73, 69};
-				E.theme.status_fg = (Color){235, 219, 178};
-				E.theme.border = (Color){80, 73, 69};
-				E.theme.visual_bg = (Color){68, 65, 59};
-				E.theme.visual_fg = (Color){235, 219, 178};
-			} else if (strcmp(val, "nord") == 0) {
-				E.theme_preset = THEME_NORD;
-				E.theme.bg = (Color){46, 52, 64};
-				E.theme.fg = (Color){216, 222, 233};
-				E.theme.comment = (Color){76, 86, 106};
-				E.theme.keyword1 = (Color){129, 161, 193};
-				E.theme.keyword2 = (Color){136, 192, 208};
-				E.theme.string = (Color){163, 190, 140};
-				E.theme.number = (Color){180, 142, 173};
-				E.theme.line_number = (Color){76, 86, 106};
-				E.theme.status_bg = (Color){59, 66, 82};
-				E.theme.status_fg = (Color){216, 222, 233};
-				E.theme.border = (Color){59, 66, 82};
-				E.theme.visual_bg = (Color){67, 76, 94};
-				E.theme.visual_fg = (Color){216, 222, 233};
-			} else if (strcmp(val, "dracula") == 0) {
-				E.theme_preset = THEME_DRACULA;
-				E.theme.bg = (Color){40, 42, 54};
-				E.theme.fg = (Color){248, 248, 242};
-				E.theme.comment = (Color){98, 114, 164};
-				E.theme.keyword1 = (Color){255, 121, 198};
-				E.theme.keyword2 = (Color){139, 233, 253};
-				E.theme.string = (Color){241, 250, 140};
-				E.theme.number = (Color){189, 147, 249};
-				E.theme.line_number = (Color){98, 114, 164};
-				E.theme.status_bg = (Color){68, 71, 90};
-				E.theme.status_fg = (Color){248, 248, 242};
-				E.theme.border = (Color){68, 71, 90};
-				E.theme.visual_bg = (Color){68, 71, 90};
-				E.theme.visual_fg = (Color){248, 248, 242};
-			} else if (strcmp(val, "monokai") == 0) {
-				E.theme_preset = THEME_MONOKAI;
-				E.theme.bg = (Color){39, 40, 34};
-				E.theme.fg = (Color){248, 248, 242};
-				E.theme.comment = (Color){117, 113, 94};
-				E.theme.keyword1 = (Color){249, 38, 114};
-				E.theme.keyword2 = (Color){102, 217, 239};
-				E.theme.string = (Color){230, 219, 116};
-				E.theme.number = (Color){174, 129, 255};
-				E.theme.line_number = (Color){117, 113, 94};
-				E.theme.status_bg = (Color){60, 61, 55};
-				E.theme.status_fg = (Color){248, 248, 242};
-				E.theme.border = (Color){60, 61, 55};
-				E.theme.visual_bg = (Color){73, 72, 62};
-				E.theme.visual_fg = (Color){248, 248, 242};
-			} else if (strcmp(val, "solarized") == 0) {
-				E.theme_preset = THEME_SOLARIZED;
-				E.theme.bg = (Color){0, 43, 54};
-				E.theme.fg = (Color){131, 148, 150};
-				E.theme.comment = (Color){88, 110, 117};
-				E.theme.keyword1 = (Color){38, 139, 210};
-				E.theme.keyword2 = (Color){42, 161, 152};
-				E.theme.string = (Color){42, 161, 152};
-				E.theme.number = (Color){211, 54, 130};
-				E.theme.line_number = (Color){88, 110, 117};
-				E.theme.status_bg = (Color){7, 54, 66};
-				E.theme.status_fg = (Color){147, 161, 161};
-				E.theme.border = (Color){7, 54, 66};
-				E.theme.visual_bg = (Color){7, 54, 66};
-				E.theme.visual_fg = (Color){147, 161, 161};
-			} else if (strcmp(val, "tokyonight") == 0) {
-				E.theme_preset = THEME_TOKYONIGHT;
-				E.theme.bg = (Color){26, 27, 38};
-				E.theme.fg = (Color){192, 202, 245};
-				E.theme.comment = (Color){86, 95, 137};
-				E.theme.keyword1 = (Color){187, 154, 247};
-				E.theme.keyword2 = (Color){125, 207, 255};
-				E.theme.string = (Color){158, 206, 106};
-				E.theme.number = (Color){255, 158, 100};
-				E.theme.line_number = (Color){60, 68, 102};
-				E.theme.status_bg = (Color){36, 40, 59};
-				E.theme.status_fg = (Color){192, 202, 245};
-				E.theme.border = (Color){60, 68, 102};
-				E.theme.visual_bg = (Color){40, 52, 87};
-				E.theme.visual_fg = (Color){192, 202, 245};
-			} else if (strcmp(val, "catppuccin") == 0) {
-				E.theme_preset = THEME_CATPPUCCIN;
-				E.theme.bg = (Color){30, 30, 46};
-				E.theme.fg = (Color){205, 214, 244};
-				E.theme.comment = (Color){108, 112, 134};
-				E.theme.keyword1 = (Color){203, 166, 247};
-				E.theme.keyword2 = (Color){137, 220, 235};
-				E.theme.string = (Color){166, 227, 161};
-				E.theme.number = (Color){250, 179, 135};
-				E.theme.line_number = (Color){88, 91, 112};
-				E.theme.status_bg = (Color){49, 50, 68};
-				E.theme.status_fg = (Color){205, 214, 244};
-				E.theme.border = (Color){69, 71, 90};
-				E.theme.visual_bg = (Color){69, 71, 90};
-				E.theme.visual_fg = (Color){205, 214, 244};
-			} else if (strcmp(val, "onedark") == 0) {
-				E.theme_preset = THEME_ONEDARK;
-				E.theme.bg = (Color){40, 44, 52};
-				E.theme.fg = (Color){171, 178, 191};
-				E.theme.comment = (Color){92, 99, 112};
-				E.theme.keyword1 = (Color){198, 120, 221};
-				E.theme.keyword2 = (Color){86, 182, 194};
-				E.theme.string = (Color){152, 195, 121};
-				E.theme.number = (Color){209, 154, 102};
-				E.theme.line_number = (Color){76, 82, 99};
-				E.theme.status_bg = (Color){33, 37, 43};
-				E.theme.status_fg = (Color){171, 178, 191};
-				E.theme.border = (Color){60, 64, 72};
-				E.theme.visual_bg = (Color){62, 68, 81};
-				E.theme.visual_fg = (Color){220, 223, 228};
-			} else if (strcmp(val, "material") == 0) {
-				E.theme_preset = THEME_MATERIAL;
-				E.theme.bg = (Color){38, 50, 56};
-				E.theme.fg = (Color){238, 255, 255};
-				E.theme.comment = (Color){84, 110, 122};
-				E.theme.keyword1 = (Color){199, 146, 234};
-				E.theme.keyword2 = (Color){130, 170, 255};
-				E.theme.string = (Color){195, 232, 141};
-				E.theme.number = (Color){247, 140, 108};
-				E.theme.line_number = (Color){63, 81, 88};
-				E.theme.status_bg = (Color){32, 43, 48};
-				E.theme.status_fg = (Color){238, 255, 255};
-				E.theme.border = (Color){63, 81, 88};
-				E.theme.visual_bg = (Color){51, 71, 79};
-				E.theme.visual_fg = (Color){238, 255, 255};
-			} else if (strcmp(val, "everforest") == 0) {
-				E.theme_preset = THEME_EVERFOREST;
-				E.theme.bg = (Color){45, 53, 59};
-				E.theme.fg = (Color){211, 198, 170};
-				E.theme.comment = (Color){133, 146, 137};
-				E.theme.keyword1 = (Color){230, 126, 128};
-				E.theme.keyword2 = (Color){127, 187, 179};
-				E.theme.string = (Color){167, 192, 128};
-				E.theme.number = (Color){219, 188, 127};
-				E.theme.line_number = (Color){86, 99, 98};
-				E.theme.status_bg = (Color){55, 63, 68};
-				E.theme.status_fg = (Color){211, 198, 170};
-				E.theme.border = (Color){67, 76, 81};
-				E.theme.visual_bg = (Color){67, 76, 81};
-				E.theme.visual_fg = (Color){211, 198, 170};
-			} else if (strcmp(val, "rosepine") == 0) {
-				E.theme_preset = THEME_ROSEPINE;
-				E.theme.bg = (Color){25, 23, 36};
-				E.theme.fg = (Color){224, 222, 244};
-				E.theme.comment = (Color){110, 106, 134};
-				E.theme.keyword1 = (Color){196, 167, 231};
-				E.theme.keyword2 = (Color){156, 207, 216};
-				E.theme.string = (Color){246, 193, 119};
-				E.theme.number = (Color){235, 188, 186};
-				E.theme.line_number = (Color){82, 79, 103};
-				E.theme.status_bg = (Color){38, 35, 58};
-				E.theme.status_fg = (Color){224, 222, 244};
-				E.theme.border = (Color){49, 46, 73};
-				E.theme.visual_bg = (Color){64, 61, 82};
-				E.theme.visual_fg = (Color){224, 222, 244};
-			} else if (strcmp(val, "github-dark") == 0) {
-				E.theme_preset = THEME_GITHUB_DARK;
-				E.theme.bg = (Color){13, 17, 23};
-				E.theme.fg = (Color){201, 209, 217};
-				E.theme.comment = (Color){139, 148, 158};
-				E.theme.keyword1 = (Color){255, 123, 114};
-				E.theme.keyword2 = (Color){121, 192, 255};
-				E.theme.string = (Color){165, 214, 255};
-				E.theme.number = (Color){121, 192, 255};
-				E.theme.line_number = (Color){72, 79, 88};
-				E.theme.status_bg = (Color){22, 27, 34};
-				E.theme.status_fg = (Color){201, 209, 217};
-				E.theme.border = (Color){48, 54, 61};
-				E.theme.visual_bg = (Color){33, 38, 45};
-				E.theme.visual_fg = (Color){201, 209, 217};
-			} else if (strcmp(val, "github-light") == 0) {
-				E.theme_preset = THEME_GITHUB_LIGHT;
-				E.theme.bg = (Color){255, 255, 255};
-				E.theme.fg = (Color){36, 41, 47};
-				E.theme.comment = (Color){106, 115, 125};
-				E.theme.keyword1 = (Color){207, 34, 46};
-				E.theme.keyword2 = (Color){5, 80, 174};
-				E.theme.string = (Color){10, 48, 105};
-				E.theme.number = (Color){5, 80, 174};
-				E.theme.line_number = (Color){140, 149, 159};
-				E.theme.status_bg = (Color){240, 246, 252};
-				E.theme.status_fg = (Color){36, 41, 47};
-				E.theme.border = (Color){208, 215, 222};
-				E.theme.visual_bg = (Color){221, 244, 255};
-				E.theme.visual_fg = (Color){36, 41, 47};
-			} else if (strcmp(val, "ayu") == 0) {
-				E.theme_preset = THEME_AYU;
-				E.theme.bg = (Color){15, 20, 25};
-				E.theme.fg = (Color){191, 189, 182};
-				E.theme.comment = (Color){92, 103, 115};
-				E.theme.keyword1 = (Color){255, 143, 64};
-				E.theme.keyword2 = (Color){57, 186, 230};
-				E.theme.string = (Color){170, 217, 76};
-				E.theme.number = (Color){215, 155, 255};
-				E.theme.line_number = (Color){60, 75, 90};
-				E.theme.status_bg = (Color){20, 25, 31};
-				E.theme.status_fg = (Color){191, 189, 182};
-				E.theme.border = (Color){38, 48, 59};
-				E.theme.visual_bg = (Color){38, 48, 59};
-				E.theme.visual_fg = (Color){191, 189, 182};
-			} else if (strcmp(val, "kanagawa") == 0) {
-				E.theme_preset = THEME_KANAGAWA;
-				E.theme.bg = (Color){31, 31, 40};
-				E.theme.fg = (Color){220, 215, 186};
-				E.theme.comment = (Color){114, 113, 105};
-				E.theme.keyword1 = (Color){149, 127, 184};
-				E.theme.keyword2 = (Color){127, 180, 202};
-				E.theme.string = (Color){152, 187, 108};
-				E.theme.number = (Color){210, 126, 153};
-				E.theme.line_number = (Color){84, 84, 109};
-				E.theme.status_bg = (Color){42, 42, 55};
-				E.theme.status_fg = (Color){220, 215, 186};
-				E.theme.border = (Color){54, 54, 70};
-				E.theme.visual_bg = (Color){43, 57, 63};
-				E.theme.visual_fg = (Color){220, 215, 186};
-			}
+			editorApplyThemeByName(val);
 		} else if (strcmp(key, "ai_provider") == 0) {
-			if (strcmp(val, "ollama") == 0) E.ai_provider_type = AI_PROVIDER_OLLAMA;
-			else if (strcmp(val, "anthropic") == 0 || strcmp(val, "claude") == 0) E.ai_provider_type = AI_PROVIDER_ANTHROPIC;
-			else if (strcmp(val, "openai") == 0 || strcmp(val, "gpt") == 0 || strcmp(val, "groq") == 0) E.ai_provider_type = AI_PROVIDER_OPENAI;
+			hkApplyProviderAlias(val);
 		} else if (strcmp(key, "ai_api_key") == 0) {
 			free(E.ai_api_key);
 			if (strlen(val) > 0) E.ai_api_key = strdup(val);
@@ -8702,9 +9901,8 @@ void editorLoadConfig() {
 			E.ai_tools_enabled = atoi(val) ? 1 : 0;
 		} else if (strcmp(key, "ai_stream") == 0) {
 			E.ai_stream = atoi(val) ? 1 : 0;
-		} else if (strcmp(key, "ai_mascot") == 0) {
-			free(E.ai_mascot_path);
-			E.ai_mascot_path = strlen(val) > 0 ? strdup(val) : NULL;
+		} else if (strcmp(key, "ai_autowrite") == 0) {
+			E.ai_autowrite = atoi(val) ? 1 : 0;
 		} else if (strncmp(key, "theme_", 6) == 0) {
 			int r, g, b;
 			if (sscanf(val, "%d,%d,%d", &r, &g, &b) == 3) {
@@ -8747,6 +9945,11 @@ void initEditor() {
 	E.force_window_command = 0;
 	E.splash_active = 1;
 	E.splash_dismissed = 0;
+	E.full_redraw_pending = 1;
+	E.grid_front = NULL;
+	E.grid_back = NULL;
+	E.grid_w = 0;
+	E.grid_h = 0;
 	E.explorer_enabled = 1;
 	E.explorer_width = 25;
 	E.explorer_show_hidden = 0;
@@ -8772,7 +9975,6 @@ void initEditor() {
 	E.explorer_name = strdup("Kami");
 	E.ai_kanji = strdup("零");
 	E.ai_name = strdup("Rei");
-	E.ai_mascot_path = NULL;
 
 	E.indent_guides = 0;
 	E.scroll_speed = 3;
@@ -8806,8 +10008,8 @@ void initEditor() {
 	E.hk.recording_insert = 0;
 
 	initTheme();
-	editorLoadConfig();
 	editorInitAI();
+	editorLoadConfig();
 
 	editorUpdateWindowSize();
 
@@ -8829,6 +10031,10 @@ void editorUpdateWindowSize() {
 		E.screenrows = new_rows;
 		E.screencols = new_cols;
 		if (E.root_pane) editorResizePanes();
+		E.full_redraw_pending = 1;
+	}
+	if (E.screencols > 0 && rows > 0) {
+		gridResize(E.screencols, rows);
 	}
 }
 
@@ -8853,9 +10059,10 @@ void editorCleanup() {
 	free(E.explorer_name);
 	free(E.ai_kanji);
 	free(E.ai_name);
-	free(E.ai_mascot_path);
-	
+	free(E.session_id);
+
 	editorCleanupAI();
+	gridFree();
 }
 
 /*** main ***/
@@ -8890,7 +10097,12 @@ int main(int argc, char *argv[]) {
 		editorOpen(argv[1]);
 	}
 
-	editorSetStatusMessage("HAKO v%s | :help for commands", HAKO_VERSION);
+	if (E.session_resumed && E.session_id) {
+		editorSetStatusMessage("HAKO v%s | resumed session %s (%d turns) | /sessions to switch",
+			HAKO_VERSION, E.session_id, E.session_turn_count);
+	} else {
+		editorSetStatusMessage("HAKO v%s | :help for commands", HAKO_VERSION);
+	}
 	while (1) {
 		editorRefreshScreen();
 		editorProcessKeyPress();
