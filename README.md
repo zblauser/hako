@@ -1,8 +1,7 @@
 <p align="center">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/Orphic-lab/Orphic-lab.github.io/93ac40cc28da504f1ea7714c1c6382f741c04fb8/assets/banner-dark.svg?token=AM5CXPMEES4HM5CEUU3VRU3J7OEKA$0">
-    <img src="https://github.com/Orphic-lab/Orphic-lab.github.io/blob/main/assets/banner-light.gif?raw=true$0" alt="HAKO" width="100%"/>
-  </picture>
+  <a href="https://mithraeums.github.io">
+    <img src="https://mithraeums.github.io/assets/banner-hako-dark.svg" alt="hako — a quiet box around the cursor" width="100%"/>
+  </a>
 </p>
 
 <p align="center">
@@ -10,27 +9,41 @@
 </p>
 
 <p align="center">
-  <img src="https://github.com/Orphic-lab/Orphic-lab.github.io/blob/main/assets/screenshot-splash.png?raw=true$0" alt="Splash" width="80%"/>
+  <a href="https://github.com/mithraeums/hako/releases"><img src="https://img.shields.io/badge/version-v0.0.9-b89656?style=flat-square&labelColor=14130f" alt="v0.0.9"/></a>
+  <img src="https://img.shields.io/badge/license-GPL--3.0-c8c2b2?style=flat-square&labelColor=14130f" alt="GPL-3.0"/>
+  <img src="https://img.shields.io/badge/C99-single%20file-c8c2b2?style=flat-square&labelColor=14130f" alt="C99 single file"/>
+  <img src="https://img.shields.io/badge/themes-17-c8c2b2?style=flat-square&labelColor=14130f" alt="17 themes"/>
+  <img src="https://img.shields.io/badge/languages-40%2B-c8c2b2?style=flat-square&labelColor=14130f" alt="40+ languages"/>
+</p>
+
+<p align="center">
+  <sub><a href="https://mithraeums.github.io">site</a> &nbsp;·&nbsp; <a href="https://github.com/mithraeums/hako/releases">releases</a> &nbsp;·&nbsp; <a href="https://github.com/mithraeums/hakoCLAW">claw</a> &nbsp;·&nbsp; <a href="https://github.com/mithraeums">org</a></sub>
+</p>
+
+<br>
+
+<p align="center">
+  <img src="https://github.com/mithraeums/mithraeums.github.io/blob/main/assets/screenshot-splash.png?raw=true" alt="Splash" width="82%"/>
 </p>
 
 <table align="center">
   <tr>
     <td align="center" width="50%">
-      <img src="https://github.com/Orphic-lab/Orphic-lab.github.io/blob/main/assets/screenshot-explorer.png?raw=true$0" alt="Kami explorer" width="100%"/><br/>
+      <img src="https://github.com/mithraeums/mithraeums.github.io/blob/main/assets/screenshot-explorer.png?raw=true" alt="Kami explorer" width="100%"/><br/>
       <sub><b>紙 Kami</b>: file explorer</sub>
     </td>
     <td align="center" width="50%">
-      <img src="https://github.com/Orphic-lab/Orphic-lab.github.io/blob/main/assets/screenshot-rei.png?raw=true$0" alt="Split panes with Rei" width="100%"/><br/>
+      <img src="https://github.com/mithraeums/mithraeums.github.io/blob/main/assets/screenshot-rei.png?raw=true" alt="Split panes with Rei" width="100%"/><br/>
       <sub>Split panes + <b>零 Rei</b> AI</sub>
     </td>
   </tr>
   <tr>
     <td align="center" width="50%">
-      <img src="https://github.com/Orphic-lab/Orphic-lab.github.io/blob/main/assets/screenshot-editor.png?raw=true$0" alt="Editor help" width="100%"/><br/>
+      <img src="https://github.com/mithraeums/mithraeums.github.io/blob/main/assets/screenshot-editor.png?raw=true" alt="Editor help" width="100%"/><br/>
       <sub>Editor help overlay</sub>
     </td>
     <td align="center" width="50%">
-      <img src="https://github.com/Orphic-lab/Orphic-lab.github.io/blob/main/assets/screenshot-themes.png?raw=true$0" alt="Theme picker" width="100%"/><br/>
+      <img src="https://github.com/mithraeums/mithraeums.github.io/blob/main/assets/screenshot-themes.png?raw=true" alt="Theme picker" width="100%"/><br/>
       <sub>Theme picker · 17 presets</sub>
     </td>
   </tr>
@@ -45,6 +58,8 @@
 █████████ Provider: You Choose
 ▀█▀▀█▀▀█▀ Model: You Choose
 ```
+
+<p align="center"><sub><b>—— I ——</b></sub></p>
 
 ## Overview
 
@@ -63,6 +78,8 @@
 - **Mouse Support**: click to position, scroll wheel moves cursor
 - **17 Themes**: dark, light, gruvbox, nord, dracula, monokai, solarized, tokyonight, catppuccin, onedark, material, everforest, rosepine, github-dark, github-light, ayu, kanagawa
 - **Customizable**: every setting in `.hakorc`, model/provider choices persist in `~/.hako/state`
+
+<p align="center"><sub><b>—— II ——</b></sub></p>
 
 ## Build
 
@@ -111,6 +128,8 @@ Notes:
 - AI panel needs `curl` for HTTPS requests; `apk add curl` is required before using Rei.
 - Narrow screens auto-stack the AI panel below the editor instead of squeezing horizontally.
 - iSh runs single-threaded under emulation; expect slower stream rendering.
+
+<p align="center"><sub><b>—— III ——</b></sub></p>
 
 ## Key Bindings
 
@@ -226,6 +245,8 @@ Notes:
 
 **Pane control** (any focused pane): `:q rei` / `:q kami` (also `:close <name>`) closes the named side panel.
 
+<p align="center"><sub><b>—— IV ——</b></sub></p>
+
 ## Configuration
 
 Use supplied config, or generate one with `:config` inside the editor. HAKO looks for `.hakorc` in the current directory first, then your home directory.
@@ -254,6 +275,8 @@ ai_autowrite=1                # 0 stages writes to <path>.hako-pending
 
 Run `:config` to generate a fully documented `.hakorc` with all options.
 
+<p align="center"><sub><b>—— V ——</b></sub></p>
+
 ## Supported Languages
 
 HAKO provides syntax color for 40+ languages, some of which include:
@@ -265,6 +288,8 @@ HAKO provides syntax color for 40+ languages, some of which include:
 **Functional**: Haskell, OCaml, F#, Elixir  
 **Modern**: Swift, Dart, Julia, Nim  
 **Config**: YAML, TOML, Dockerfile, Makefile
+
+<p align="center"><sub><b>—— VI ——</b></sub></p>
 
 ## Change Log
 
@@ -425,6 +450,8 @@ Bug Fixes
 - Ability to save and load files
 </details>
 
+<p align="center"><sub><b>—— VII ——</b></sub></p>
+
 ## Roadmap
 - [ ] Windows parity
 - [ ] Diff-render (fewer redraws)
@@ -432,6 +459,8 @@ Bug Fixes
 - [ ] Write-file diff preview with confirm
 - [ ] OpenAI/Ollama tool parity
 - [ ] Buffer list (`:ls`, `:b`)
+
+<p align="center"><sub><b>—— VIII ——</b></sub></p>
 
 ## Contributing
 If you share the belief that simplicity empowers creativity, feel free to contribute.
@@ -478,4 +507,8 @@ Sections of codebase are as follows:
 ## Thank you for your attention.
 This project started out of curiosity and a simple C text editor tutorial. If you hit any issues, feel free to open an issue on GitHub.
 Pull requests, suggestions, or even thoughtful discussions are welcome.
+
+<p align="center"><sub><a href="LICENSE">— SEE LICENSE —</a> &nbsp;·&nbsp; GPL-3.0</sub></p>
+
+<p align="center"><sub><em>— deus sol invictus mithras —</em></sub></p>
 
