@@ -33,7 +33,11 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 #include <conio.h>
 #include <io.h>
 #include <direct.h>
+#include <sys/types.h>
+#include <sys/stat.h>
+#ifndef PATH_MAX
 #define PATH_MAX MAX_PATH
+#endif
 #define popen _popen
 #define pclose _pclose
 #define getcwd _getcwd
@@ -41,9 +45,42 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 #define STDOUT_FILENO 1
 #define read(fd, buf, n) _read(fd, buf, n)
 #define write(fd, buf, n) _write(fd, buf, n)
+#define mkdir(p, m) _mkdir(p)
+#define realpath(p, r) _fullpath((r), (p), PATH_MAX)
 #ifdef _MSC_VER
 #define S_ISDIR(m) (((m) & _S_IFMT) == _S_IFDIR)
+#define S_ISREG(m) (((m) & _S_IFMT) == _S_IFREG)
 #define strcasecmp _stricmp
+#endif
+#if defined(__MINGW32__) || defined(__MINGW64__)
+#include <dirent.h>
+#include <unistd.h>
+#ifndef S_ISREG
+#define S_ISREG(m) (((m) & _S_IFMT) == _S_IFREG)
+#endif
+#ifndef S_ISDIR
+#define S_ISDIR(m) (((m) & _S_IFMT) == _S_IFDIR)
+#endif
+#include <stdlib.h>
+static long hk_getline(char **lineptr, size_t *n, FILE *stream) {
+	if (!lineptr || !n || !stream) return -1;
+	if (!*lineptr || *n == 0) { *n = 256; *lineptr = realloc(*lineptr, *n); if (!*lineptr) return -1; }
+	size_t len = 0; int c;
+	while ((c = fgetc(stream)) != EOF) {
+		if (len + 1 >= *n) {
+			size_t nn = *n * 2;
+			char *t = realloc(*lineptr, nn);
+			if (!t) return -1;
+			*lineptr = t; *n = nn;
+		}
+		(*lineptr)[len++] = (char)c;
+		if (c == '\n') break;
+	}
+	if (len == 0 && c == EOF) return -1;
+	(*lineptr)[len] = '\0';
+	return (long)len;
+}
+#define getline hk_getline
 #endif
 #else
 #include <sys/ioctl.h>
