@@ -17,7 +17,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 */
 				
 /*** includes ***/
-#define HAKO_VERSION "0.1.0"
+#define HAKO_VERSION "0.1.1"
 
 #include <ctype.h>
 #include <errno.h>
@@ -1332,6 +1332,36 @@ void die(const char *s) {
 	exit(1);
 }
 
+void detectTerminalType() {
+	char *term = getenv("TERM");
+	char *colorterm = getenv("COLORTERM");
+	char *term_program = getenv("TERM_PROGRAM");
+
+	E.term_type = TERM_BASIC;
+
+	if (term_program && strcmp(term_program, "Apple_Terminal") == 0) {
+		E.term_type = TERM_XTERM_256;
+		return;
+	}
+
+	if (colorterm) {
+		if (strcmp(colorterm, "truecolor") == 0 || strcmp(colorterm, "24bit") == 0) {
+			E.term_type = TERM_TRUECOLOR;
+			return;
+		}
+	}
+
+	if (term) {
+		if (strstr(term, "256color") || strstr(term, "kitty") ||
+			strstr(term, "alacritty") || strstr(term, "ghostty") ||
+			strstr(term, "wezterm") || strstr(term, "iterm")) {
+			E.term_type = TERM_XTERM_256;
+		} else if (strstr(term, "xterm")) {
+			E.term_type = TERM_XTERM_256;
+		}
+	}
+}
+
 #ifndef _WIN32
 volatile sig_atomic_t winch_received = 0;
 
@@ -1381,36 +1411,6 @@ void enableRawMode() {
 		write(STDOUT_FILENO, "\x1b[?1003h", 8);
 		write(STDOUT_FILENO, "\x1b[?1015h", 8);
 		write(STDOUT_FILENO, "\x1b[?1006h", 8);
-	}
-}
-
-void detectTerminalType() {
-	char *term = getenv("TERM");
-	char *colorterm = getenv("COLORTERM");
-	char *term_program = getenv("TERM_PROGRAM");
-	
-	E.term_type = TERM_BASIC;
-	
-	if (term_program && strcmp(term_program, "Apple_Terminal") == 0) {
-		E.term_type = TERM_XTERM_256;
-		return;
-	}
-	
-	if (colorterm) {
-		if (strcmp(colorterm, "truecolor") == 0 || strcmp(colorterm, "24bit") == 0) {
-			E.term_type = TERM_TRUECOLOR;
-			return;
-		}
-	}
-	
-	if (term) {
-		if (strstr(term, "256color") || strstr(term, "kitty") || 
-			strstr(term, "alacritty") || strstr(term, "ghostty") || 
-			strstr(term, "wezterm") || strstr(term, "iterm")) {
-			E.term_type = TERM_XTERM_256;
-		} else if (strstr(term, "xterm")) {
-			E.term_type = TERM_XTERM_256;
-		}
 	}
 }
 
@@ -1464,14 +1464,21 @@ static int gridColorEq(Color a, Color b) {
 void gridResize(int w, int h) {
 	if (w < 1) w = 1;
 	if (h < 1) h = 1;
+	if (w > 4096) w = 4096;
+	if (h > 4096) h = 4096;
 	if (w == E.grid_w && h == E.grid_h && E.grid_front && E.grid_back) return;
 	free(E.grid_front);
 	free(E.grid_back);
 	E.grid_w = w;
 	E.grid_h = h;
-	int n = w * h;
+	size_t n = (size_t)w * (size_t)h;
 	E.grid_front = calloc(n, sizeof(Cell));
 	E.grid_back = calloc(n, sizeof(Cell));
+	if (!E.grid_front || !E.grid_back) {
+		free(E.grid_front); free(E.grid_back);
+		E.grid_front = E.grid_back = NULL;
+		E.grid_w = E.grid_h = 0;
+	}
 }
 
 void gridFree(void) {
@@ -6355,6 +6362,80 @@ void editorDrawSplash() {
 	setThemeColor(&ab, subtitle_color);
 	abAppend(&ab, subtitle, strlen(subtitle));
 
+	/* # NEW + # TIPS — only render if screen has the vertical room. */
+	if (E.screenrows >= center_y + 20) {
+		static const char *HK_NEW[] = {
+			"Windows build link fix (detectTerminalType)",
+			"iSh hardening: bounded skill loader, gridResize cap",
+			"Auto-resume hint in status bar",
+			NULL
+		};
+		static const char *HK_TIPS[] = {
+			":help opens the full command list",
+			":q rei|kami closes a side pane from any focused pane",
+			":theme <name> swaps theme at runtime (try gruvbox-dark)",
+			"/trust grants the AI panel file-op access",
+			"Ctrl-W cycles focus between editor / explorer / AI",
+			"gg/G + Ctrl-D/U scroll AI history in visual mode",
+			NULL
+		};
+
+		Color label_color = {180, 180, 180};
+		Color bullet_color = E.theme.border;
+		Color body_color = {130, 130, 130};
+
+		const char *new_label = "# NEW";
+		int nl_col = (E.screencols - (int)strlen(new_label)) / 2;
+		snprintf(buf, sizeof(buf), "\x1b[%d;%dH", center_y + 12, nl_col + 1);
+		abAppend(&ab, buf, strlen(buf));
+		setThemeBgColor(&ab, E.theme.bg);
+		setThemeColor(&ab, label_color);
+		abAppend(&ab, new_label, strlen(new_label));
+
+		for (int i = 0; i < 2 && HK_NEW[i]; i++) {
+			char line[160];
+			snprintf(line, sizeof(line), "· %s", HK_NEW[i]);
+			int col = (E.screencols - (int)strlen(line)) / 2;
+			snprintf(buf, sizeof(buf), "\x1b[%d;%dH", center_y + 13 + i, col + 1);
+			abAppend(&ab, buf, strlen(buf));
+			setThemeBgColor(&ab, E.theme.bg);
+			setThemeColor(&ab, bullet_color);
+			abAppend(&ab, "·", strlen("·"));
+			setThemeColor(&ab, body_color);
+			abAppend(&ab, line + strlen("·"), strlen(line) - strlen("·"));
+		}
+
+		/* Rotate tips by day-of-year so the splash refreshes daily. */
+		int total = 0; while (HK_TIPS[total]) total++;
+		time_t now = time(NULL);
+		struct tm *tm = localtime(&now);
+		int seed = tm ? tm->tm_yday : 0;
+		int t0 = total ? (seed % total) : 0;
+		int t1 = total ? ((seed + 1) % total) : 0;
+
+		const char *tip_label = "# TIPS";
+		int tl_col = (E.screencols - (int)strlen(tip_label)) / 2;
+		snprintf(buf, sizeof(buf), "\x1b[%d;%dH", center_y + 16, tl_col + 1);
+		abAppend(&ab, buf, strlen(buf));
+		setThemeBgColor(&ab, E.theme.bg);
+		setThemeColor(&ab, label_color);
+		abAppend(&ab, tip_label, strlen(tip_label));
+
+		int pick[2] = {t0, t1};
+		for (int i = 0; i < 2; i++) {
+			char line[160];
+			snprintf(line, sizeof(line), "· %s", HK_TIPS[pick[i]]);
+			int col = (E.screencols - (int)strlen(line)) / 2;
+			snprintf(buf, sizeof(buf), "\x1b[%d;%dH", center_y + 17 + i, col + 1);
+			abAppend(&ab, buf, strlen(buf));
+			setThemeBgColor(&ab, E.theme.bg);
+			setThemeColor(&ab, bullet_color);
+			abAppend(&ab, "·", strlen("·"));
+			setThemeColor(&ab, body_color);
+			abAppend(&ab, line + strlen("·"), strlen(line) - strlen("·"));
+		}
+	}
+
 	const char *instruction = "Press any key to start";
 	int instr_col = (E.screencols - strlen(instruction)) / 2;
 	snprintf(buf, sizeof(buf), "\x1b[%d;%dH", E.screenrows, instr_col + 1);
@@ -7756,11 +7837,12 @@ int hkLoadSkills(aiData *data) {
 	DIR *d = opendir(skills);
 	if (!d) return 0;
 
+	enum { MAX_SKILLS = 64, MAX_TOTAL = 1u << 20 }; /* 1 MiB cap on system prompt */
 	char *buf = NULL;
 	size_t total = 0;
 	int loaded = 0;
 	struct dirent *e;
-	while ((e = readdir(d))) {
+	while ((e = readdir(d)) && loaded < MAX_SKILLS) {
 		if (e->d_name[0] == '.') continue;
 		int nlen = strlen(e->d_name);
 		if (nlen < 4 || strcmp(e->d_name + nlen - 3, ".md") != 0) continue;
@@ -7774,11 +7856,16 @@ int hkLoadSkills(aiData *data) {
 		if (sz < 0 || sz > 200000) { fclose(fp); continue; }
 		char header[256];
 		int hlen = snprintf(header, sizeof(header), "\n<skill name=\"%s\">\n", e->d_name);
-		char *tail = "\n</skill>\n";
-		int tlen = strlen(tail);
-		buf = realloc(buf, total + hlen + sz + tlen + 1);
+		const char *tail = "\n</skill>\n";
+		int tlen = (int)strlen(tail);
+		size_t need = total + (size_t)hlen + (size_t)sz + (size_t)tlen + 1;
+		if (need > MAX_TOTAL) { fclose(fp); break; }
+		char *nb = realloc(buf, need);
+		if (!nb) { fclose(fp); break; }
+		buf = nb;
 		memcpy(buf + total, header, hlen); total += hlen;
-		fread(buf + total, 1, sz, fp); total += sz;
+		size_t got = fread(buf + total, 1, (size_t)sz, fp);
+		total += got;
 		memcpy(buf + total, tail, tlen); total += tlen;
 		fclose(fp);
 		loaded++;
@@ -9869,7 +9956,7 @@ void editorLoadConfig() {
 		if (fp) E.config_path = strdup(config_paths[i]);
 	}
 
-	if (!fp) return;
+	if (!fp) { hkLoadSession(); return; }
 
 	char *line = NULL;
 	size_t len = 0;
@@ -10062,6 +10149,10 @@ void initEditor() {
 void editorUpdateWindowSize() {
 	int rows, cols;
 	if (getWindowSize(&rows, &cols) == -1) die("getWindowSize");
+	if (rows < 2) rows = 24;
+	if (cols < 1) cols = 80;
+	if (rows > 4096) rows = 4096;
+	if (cols > 4096) cols = 4096;
 	int new_rows = rows - 2;
 	int new_cols = cols;
 	if (new_rows != E.screenrows || new_cols != E.screencols) {

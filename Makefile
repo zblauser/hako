@@ -25,12 +25,24 @@ else
     endif
 endif
 
-.PHONY: all clean
+.PHONY: all clean icons
 all: $(BIN)
 
-# ---------- Windows: embed icon via resource ----------
+# ---------- icons ----------
+# Regenerate icon/hako.{icns,ico,png} from icon/hako.svg.
+# Requires rsvg-convert or ImageMagick. iconutil (macOS) → .icns, magick → .ico.
+icons:
+	@cd $(ICON_DIR) && bash build-icons.sh
+
+# ---------- Windows: embed icon via resource (optional — skip if .ico missing) ----------
 ifeq ($(PLATFORM),windows)
 
+HAS_ICO := $(wildcard $(ICON_DIR)/hako.ico)
+
+ifeq ($(HAS_ICO),)
+$(BIN): hako.c
+	$(CC) $(CFLAGS) hako.c -o $@ $(LDLIBS)
+else
 hako.rc:
 	@printf 'IDI_ICON1 ICON "$(ICON_DIR)/hako.ico"\n' > $@
 
@@ -39,6 +51,7 @@ hako.res: hako.rc $(ICON_DIR)/hako.ico
 
 $(BIN): hako.c hako.res
 	$(CC) $(CFLAGS) hako.c hako.res -o $@ $(LDLIBS)
+endif
 
 endif
 

@@ -36,8 +36,7 @@ venv.bak/
 # editors
 .vscode/
 .idea/
-*.sublime-project
-*.sublime-workspace
+*.swp
 
 # logs
 *.log

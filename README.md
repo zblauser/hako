@@ -9,7 +9,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/mithraeums/hako/releases"><img src="https://img.shields.io/badge/version-v0.0.9-b89656?style=flat-square&labelColor=14130f" alt="v0.0.9"/></a>
+  <a href="https://github.com/mithraeums/hako/releases"><img src="https://img.shields.io/badge/version-v0.1.1-b89656?style=flat-square&labelColor=14130f" alt="v0.1.1"/></a>
   <img src="https://img.shields.io/badge/license-GPL--3.0-c8c2b2?style=flat-square&labelColor=14130f" alt="GPL-3.0"/>
   <img src="https://img.shields.io/badge/C99-single%20file-c8c2b2?style=flat-square&labelColor=14130f" alt="C99 single file"/>
   <img src="https://img.shields.io/badge/themes-17-c8c2b2?style=flat-square&labelColor=14130f" alt="17 themes"/>
@@ -51,7 +51,7 @@
 
 <br>
 
-零 **Rei** lives inside Hako; powered by hakoCLAW:
+零 **Rei** lives inside Hako; powered by <a href="https://github.com/mithraeums/hakoCLAW"> hakoCLAW</a>:
 ```
  ▄█████▄
 ██ ███ ██ Rei: v1.1
@@ -103,6 +103,15 @@ cp hako /usr/local/bin/hako          # Linux / macOS
 
 > **Deps:** C standard library + POSIX/Win32 system headers + `pthread`. No third-party libraries linked. AI features shell out to `curl(1)` at runtime.
 
+## Install
+
+```sh
+# Curl one-liner (Linux / macOS / Windows-MinGW)
+curl -fsSL https://raw.githubusercontent.com/mithraeums/hako/main/install.sh | sh
+```
+
+Verifies sha256, installs to `/usr/local/bin` if writable else `~/.local/bin`. macOS quarantine xattr stripped post-install. Set `VERIFY=0` to skip sha verify, `PREFIX=/opt` to relocate.
+
 ### Executable icon
 
 The icon files live in `icon/`:
@@ -131,7 +140,7 @@ Notes:
 
 <p align="center"><sub><b>—— III ——</b></sub></p>
 
-## Key Bindings
+## Key Bindings & Commands
 
 ### Normal Mode
 
@@ -221,7 +230,7 @@ Notes:
 |`Ctrl-C`   |Close panel                         |
 |`:q`       |Close panel                         |
 
-**Slash commands** (type inside the prompt):
+### Slash commands (inside prompt):
 
 |Command                 |Action                                       |
 |------------------------|---------------------------------------------|
@@ -293,7 +302,20 @@ HAKO provides syntax color for 40+ languages, some of which include:
 
 ## Change Log
 
-### v0.1.0 (Latest)<br>
+### v0.1.1 (Latest)<br>
+Windows + iSh fixes + splash polish.
+
+- **Windows build fixed** `detectTerminalType` definition moved outside the `#ifndef _WIN32` block (forward-decl was visible, body wasn't — MinGW link error). Unblocks `v0.1*` tag artifacts.
+- **iSh hardening** `gridResize` caps `w`/`h` at 4096 with `size_t` math + alloc-failure rollback; `editorUpdateWindowSize` clamps `rows`/`cols` (24×80 floor, 4096 ceil). Defensive fix for iPad memlock on startup.
+- **Skill loader bounded** Checked `realloc`, `fread` advance uses `got` not requested size, 64-skill ceiling, 1 MiB cumulative prompt cap, `fclose` on every early break path.
+- **`editorLoadConfig` early-return bug** No `.hakorc` previously short-circuited before `hkLoadSession()` — fresh setups never resumed. Now loads session even when config absent.
+- **Splash gained `# NEW` + `# TIPS`** sections (renders when screen has the vertical room).
+
+### Previous Versions
+<details>
+<summary>Previous Changes</summary>
+
+***v0.1.0***<br>
 Polish + portability + safety pass.
 
 Editor / panes
@@ -321,10 +343,6 @@ Build / release
 - GitHub Actions release workflow (linux/macos/windows on tag `v0.1*`)
 - README documents iSh build (`apk add gcc make musl-dev curl && make`)
 - Makefile unchanged for one-liner: `gcc -O2 -Wall hako.c -o hako -lpthread`
-
-### Previous Versions
-<details>
-<summary>Previous Changes</summary>
 
 ***v0.0.9***<br>
 Big one. HAKO goes from editor-with-AI-panel to modal editing environment with a real agent inside.
@@ -465,7 +483,7 @@ Bug Fixes
 ## Contributing
 If you share the belief that simplicity empowers creativity, feel free to contribute.
 
-#### Contribution is welcome in the form of:
+### Contribution is welcome in the form of:
 - Forking this repo
 - Submitting a Pull Request
 - Bug reports and feature requests
@@ -504,7 +522,7 @@ Sections of codebase are as follows:
 29. Init
 30. Main
 
-## Thank you for your attention.
+### Thank you for your attention.
 This project started out of curiosity and a simple C text editor tutorial. If you hit any issues, feel free to open an issue on GitHub.
 Pull requests, suggestions, or even thoughtful discussions are welcome.
 
