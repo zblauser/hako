@@ -17,7 +17,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 */
 				
 /*** includes ***/
-#define HAKO_VERSION "0.1.1"
+#define HAKO_VERSION "0.1.2"
 
 #include <ctype.h>
 #include <errno.h>
@@ -87,11 +87,15 @@ static long hk_getline(char **lineptr, size_t *n, FILE *stream) {
 #include <sys/types.h>
 #include <sys/select.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
 #include <termios.h>
 #include <unistd.h>
 #include <signal.h>
 #include <dirent.h>
 #include <limits.h>
+#ifdef __APPLE__
+#include <mach-o/dyld.h>
+#endif
 #endif
 #include <pthread.h>
 
@@ -223,6 +227,7 @@ enum terminalType {
 };
 
 enum themePreset {
+	THEME_MITHRAEUM,
 	THEME_DARK,
 	THEME_LIGHT,
 	THEME_SOLARIZED,
@@ -247,13 +252,6 @@ enum splitDirection {
 	SPLIT_NONE,
 	SPLIT_HORIZONTAL,
 	SPLIT_VERTICAL
-};
-
-enum aiProviderType {
-	AI_PROVIDER_NONE,
-	AI_PROVIDER_OLLAMA,
-	AI_PROVIDER_ANTHROPIC,
-	AI_PROVIDER_OPENAI
 };
 
 /*** struct declarations ***/
@@ -328,21 +326,6 @@ typedef struct pluginData {
 	int active;
 } pluginData;
 
-typedef struct aiProvider {
-	char *name;
-	char *endpoint;
-	char *api_key;
-	char *model;
-	int (*send_request)(const char *prompt, char **response);
-	void (*stream_response)(const char *prompt, void (*callback)(const char *chunk));
-} aiProvider;
-
-typedef struct aiMessage {
-	char *role;
-	char *content;
-	int raw;
-} aiMessage;
-
 /* history role tags: render uses these to pick prefix + color, replacing
  * the old msg_idx%2 alternation that scrambled colors when system lines
  * were interleaved with user/assistant turns. */
@@ -351,7 +334,7 @@ typedef struct aiMessage {
 #define HK_ROLE_AI     2
 
 typedef struct aiData {
-	aiProvider *provider;
+	/* display state (owned by hako, hakoc manages the API conversation) */
 	char **history;
 	unsigned char *history_role;
 	int history_count;
@@ -371,15 +354,13 @@ typedef struct aiData {
 	char *current_prompt;
 	char *current_response;
 	int active;
-	pthread_t worker_thread;
 	int streaming;
 	pthread_mutex_t lock;
-
-	aiMessage *messages;
-	int message_count;
-	int message_cap;
-	char *system_prompt;
-
+	/* live-streaming slot: index into history[] being updated as tokens arrive */
+	int stream_slot;
+	char *stream_acc;        /* accumulated raw token text */
+	size_t stream_acc_len;
+	/* token usage (received from hakoc "done" events) */
 	int last_in_tokens;
 	int last_out_tokens;
 	long total_in_tokens;
@@ -453,10 +434,6 @@ typedef struct {
 	Color char_literal;
 	Color escape;
 	Color label;
-	Color ai_bg;
-	Color ai_fg;
-	Color ai_prompt;
-	Color ai_response;
 } Theme;
 
 struct editorSyntax {
@@ -554,25 +531,11 @@ struct editorConfig {
 	char *plugin_dir;
 	pluginAPI plugin_api;
 	
-	enum aiProviderType ai_provider_type;
-	aiProvider *ai_providers[8];
-	int ai_provider_count;
-	aiProvider *current_ai;
-	char *ai_api_key;
-	char *ai_endpoint;
-	char *ai_model;
-	int ai_temperature;
-	int ai_max_tokens;
-	int ai_tools_enabled;
-	int ai_stream;
-	int ai_autowrite;
+	/* hakoc session info (received from hakoc "init" / "done" events) */
+	char *claw_session_id;
+	int claw_session_turns;
+	int claw_session_resumed;
 
-	char *session_id;
-	long session_started;
-	long session_last_used;
-	int session_turn_count;
-	int session_resumed;
-	
 	int auto_indent;
 	int smart_indent;
 	int indent_guides;
@@ -671,19 +634,14 @@ pasteBuffer *hkGetRegister(char name);
 void hkFreeRegisters(void);
 void hkPushJump(int x, int y);
 void hkClampCursor(editorPane *pane);
-void hkLogMessage(const char *role, const char *content);
-void hkLoadHistoryTail(aiData *data, int max_msgs);
-int hkLoadSkills(aiData *data);
-void hkSaveSession(void);
-void hkLoadSession(void);
-const char *hkProviderName(enum aiProviderType t);
-static int hkProjectDirPath(char *out, size_t n);
-static int hkProjectTrusted(void);
-static int hkGrantProjectTrust(void);
+static char *clawFindBinary(void);
+static int clawLaunch(aiData *data);
+static void clawShutdown(void);
+static void clawSendLine(const char *json);
+static void clawHandleEvent(aiData *data, const char *line);
+static void *clawReaderThread(void *arg);
+void aiWorkerSend(aiData *data);
 int hkHandleSlash(aiData *data, const char *prompt);
-void aiPushMessage(aiData *data, const char *role, const char *content);
-void aiPushMessageRaw(aiData *data, const char *role, const char *content_json);
-void aiFreeMessages(aiData *data);
 
 editorPane *editorCreatePane(enum paneType type, int x, int y, int width, int height);
 void editorFreePane(editorPane *pane);
@@ -711,15 +669,10 @@ void editorToggleExplorer(void);
 void editorInitAI(void);
 void editorCleanupAI(void);
 void editorToggleAI(void);
-void editorSendToAI(const char *prompt);
 void aiRender(editorPane *pane, struct abuf *ab);
 void aiInit(editorPane *pane);
 void aiHandleKey(editorPane *pane, int key);
 void editorGenerateConfig(void);
-void aiWorkerSend(aiData *data);
-void *aiWorkerThread(void *arg);
-char *aiExtractResponse(const char *json, enum aiProviderType type);
-char *aiBuildCurlCommand(aiData *data, enum aiProviderType type);
 void aiAddHistory(aiData *data, const char *text);
 void aiAddHistoryRole(aiData *data, const char *text, unsigned char role);
 int explorerCompare(const void *a, const void *b);
@@ -1209,9 +1162,7 @@ char *HAKO_HL_keywords[] = {
 	"theme_bracket", "theme_line_number", "theme_status_bg", "theme_status_fg",
 	"theme_border", "theme_visual_bg", "theme_visual_fg",
 	"auto_indent", "smart_indent", "mouse_enabled", "scroll_speed",
-	"relative_numbers", "ai_provider", "ai_api_key", "ai_model",
-	"plugin_dir", "true", "false", "normal", "insert", "claude", "gpt", "grok",
-	"ollama", "local", "1", "0", NULL
+	"relative_numbers", "plugin_dir", "true", "false", "normal", "insert", "1", "0", NULL
 };
 
 char *DEFAULT_HL_extensions[] = {NULL};
@@ -2154,13 +2105,9 @@ void editorFreePane(editorPane *pane) {
 		free(pane->ai->current_prompt);
 		free(pane->ai->current_response);
 		free(pane->ai->prompt_buffer);
-		free(pane->ai->system_prompt);
-		for (int i = 0; i < pane->ai->message_count; i++) {
-			free(pane->ai->messages[i].role);
-			free(pane->ai->messages[i].content);
-		}
-		free(pane->ai->messages);
+		free(pane->ai->stream_acc);
 		free(pane->ai);
+		clawShutdown();
 	}
 
 	free(pane);
@@ -6837,116 +6784,62 @@ void editorToggleExplorer() {
 
 /*** AI assistant ***/
 void editorInitAI() {
-	E.ai_provider_type = AI_PROVIDER_NONE;
-	E.ai_provider_count = 0;
-	E.current_ai = NULL;
-	E.ai_api_key = NULL;
-	E.ai_endpoint = NULL;
-	E.ai_model = NULL;
-	E.ai_temperature = 70;
-	E.ai_max_tokens = 2048;
-	E.ai_tools_enabled = 1;
-	E.ai_stream = 1;
-	E.ai_autowrite = 1;
-	E.session_id = NULL;
-	E.session_started = 0;
-	E.session_last_used = 0;
-	E.session_turn_count = 0;
-	E.session_resumed = 0;
+	E.claw_session_id = NULL;
+	E.claw_session_turns = 0;
+	E.claw_session_resumed = 0;
 }
 
 void editorCleanupAI() {
-	for (int i = 0; i < E.ai_provider_count; i++) {
-		free(E.ai_providers[i]->name);
-		free(E.ai_providers[i]->endpoint);
-		free(E.ai_providers[i]->api_key);
-		free(E.ai_providers[i]->model);
-		free(E.ai_providers[i]);
-	}
-	free(E.ai_api_key);
-	free(E.ai_endpoint);
-	free(E.ai_model);
+	free(E.claw_session_id);
+	E.claw_session_id = NULL;
 }
 
 void aiInit(editorPane *pane) {
 	aiData *data = calloc(1, sizeof(aiData));
 	if (!data) return;
-	
+
 	data->history = malloc(sizeof(char*) * AI_HISTORY_MAX);
 	data->history_role = calloc(AI_HISTORY_MAX, 1);
 	data->history_count = 0;
 	data->history_pos = 0;
 	data->scroll_offset = 0;
-	data->cursor_x = 0;
-	data->cursor_y = 0;
 	data->mode = MODE_NORMAL;
-	data->visual_mode = 0;
 	data->visual_start = -1;
 	data->visual_end = -1;
 	data->prompt_buffer = malloc(256);
 	data->prompt_buffer[0] = '\0';
 	data->prompt_capacity = 256;
-	data->prompt_len = 0;
-	data->prompt_cursor = 0;
-	data->current_prompt = NULL;
-	data->current_response = NULL;
 	data->active = 1;
-	data->streaming = 0;
+	data->stream_slot = -1;
 	pthread_mutex_init(&data->lock, NULL);
-	
-	const char *default_mascot[] = {
-    	"  ▄█████▄ ",
-  		" ██ ███ ██",
-   		" █████████",
-   		" ▀█▀▀█▀▀█▀",
+
+	const char *mascot[] = {
+		"  ▄█████▄ ",
+		" ██ ███ ██",
+		" █████████",
+		" ▀█▀▀█▀▀█▀",
 		NULL
 	};
-	for (int i = 0; default_mascot[i]; i++) {
-		if (data->history_count < AI_HISTORY_MAX) {
-			data->history[data->history_count++] = strdup(default_mascot[i]);
-		}
+	for (int i = 0; mascot[i]; i++) {
+		if (data->history_count < AI_HISTORY_MAX)
+			data->history[data->history_count++] = strdup(mascot[i]);
 	}
 
-	const char *pname = hkProviderName(E.ai_provider_type);
-
-	data->history[data->history_count++] = strdup("-----");
 	char line[128];
-	snprintf(line, sizeof(line), "%s v1.1", E.ai_name);
-	data->history[data->history_count++] = strdup(line);
-	snprintf(line, sizeof(line), "provider: %s", pname);
-	data->history[data->history_count++] = strdup(line);
-	if (E.ai_model) {
-		snprintf(line, sizeof(line), "model: %s", E.ai_model);
-		data->history[data->history_count++] = strdup(line);
-	}
-	if (E.ai_provider_type == AI_PROVIDER_NONE) {
-		data->history[data->history_count++] = strdup("(set ai_provider in .hakorc)");
-	}
-	snprintf(line, sizeof(line), "trust: %s", hkProjectTrusted() ? "granted" : "off");
-	data->history[data->history_count++] = strdup(line);
-	if (E.session_resumed) {
-		long ago = (long)time(NULL) - E.session_last_used;
-		const char *unit;
-		long n;
-		if (ago < 3600) { n = ago / 60; unit = "m"; }
-		else if (ago < 86400) { n = ago / 3600; unit = "h"; }
-		else { n = ago / 86400; unit = "d"; }
-		snprintf(line, sizeof(line), "session: resumed (%ld%s, %d turns)", n, unit, E.session_turn_count);
-	} else {
-		snprintf(line, sizeof(line), "session: new");
-	}
+	data->history[data->history_count++] = strdup("-----");
+	snprintf(line, sizeof(line), "%s (powered by hakoc)", E.ai_name);
 	data->history[data->history_count++] = strdup(line);
 	data->history[data->history_count++] = strdup("-----");
-	data->history[data->history_count++] = strdup("'i' chat | /help");
 
 	pane->ai = data;
 
-	hkLoadHistoryTail(data, 40);
-	int sk = hkLoadSkills(data);
-	if (sk > 0) {
-		char msg[64];
-		snprintf(msg, sizeof(msg), "loaded %d skill(s)", sk);
-		data->history[data->history_count++] = strdup(msg);
+	if (clawLaunch(data) < 0) {
+		data->history[data->history_count++] = strdup("hakoc not found.");
+		data->history[data->history_count++] = strdup("Install: curl -fsSL https://mithraeums.github.io/install.sh | sh");
+		data->history[data->history_count++] = strdup("Or: make BUNDLE_CLAW=1 from hako source.");
+		data->history[data->history_count++] = strdup("'i' to try again | /help");
+	} else {
+		data->history[data->history_count++] = strdup("'i' chat | /help");
 	}
 }
 
@@ -6963,25 +6856,16 @@ static int aiSubmitPrompt(aiData *data) {
 		return r;
 	}
 	aiAddHistoryRole(data, data->prompt_buffer, HK_ROLE_USER);
-	hkLogMessage("user", data->prompt_buffer);
-	E.session_turn_count++;
-	hkSaveSession();
-
 	free(data->current_prompt);
 	data->current_prompt = strdup(data->prompt_buffer);
-
 	data->prompt_buffer[0] = '\0';
 	data->prompt_len = 0;
+	data->prompt_cursor = 0;
 	data->mode = MODE_NORMAL;
-
-	if (E.ai_provider_type == AI_PROVIDER_NONE) {
-		aiAddHistory(data, "Set ai_provider in .hakorc");
-		aiAddHistory(data, "(ollama/anthropic/openai)");
-	} else if (data->streaming) {
+	data->history_pos = MAX(0, data->history_count - 20);
+	if (data->streaming) {
 		aiAddHistory(data, "Waiting for response...");
 	} else {
-		aiAddHistory(data, "...");
-		data->history_pos = MAX(0, data->history_count - 20);
 		aiWorkerSend(data);
 	}
 	editorSetStatusMessage("-- AI NORMAL --");
@@ -7351,27 +7235,6 @@ void editorToggleAI() {
 		return;
 	}
 	
-	if (!hkProjectTrusted()) {
-		char cwd[PATH_MAX];
-		if (getcwd(cwd, sizeof(cwd))) {
-			char q[PATH_MAX + 64];
-			snprintf(q, sizeof(q), "Trust %s for Rei file ops? (y/n/s=skip): %%s", cwd);
-			char *ans = editorPrompt(q, NULL);
-			if (ans) {
-				if (ans[0] == 'y' || ans[0] == 'Y') {
-					if (hkGrantProjectTrust()) {
-						editorSetStatusMessage("Trusted. Rei may edit files here.");
-					} else {
-						editorSetStatusMessage("Could not create .hako/");
-					}
-				} else if (ans[0] == 'n' || ans[0] == 'N') {
-					editorSetStatusMessage("Rei read-only in this dir.");
-				}
-				free(ans);
-			}
-		}
-	}
-
 	E.right_panel_width = E.explorer_width > 0 ? E.explorer_width : 30;
 	E.right_panel = editorCreatePane(PANE_AI, E.screencols - E.right_panel_width, 0, E.right_panel_width, E.screenrows);
 	E.right_panel->wrap_lines = 1;
@@ -7380,35 +7243,6 @@ void editorToggleAI() {
 	editorResizePanes();
 	
 	editorSetStatusMessage("Rei Assistant - 'i' for insert, ESC for normal, 'v' for visual");
-}
-
-void editorSendToAI(const char *prompt) {
-	editorPane **panes = NULL;
-	int count = 0;
-	editorCollectLeafPanes(E.root_pane, &panes, &count);
-	
-	for (int i = 0; i < count; i++) {
-		if (panes[i]->type == PANE_AI && panes[i]->ai) {
-			aiData *data = panes[i]->ai;
-			pthread_mutex_lock(&data->lock);
-			
-			if (data->history_count < AI_HISTORY_MAX) {
-				data->history_role[data->history_count] = HK_ROLE_USER;
-				data->history[data->history_count] = strdup(prompt);
-				data->history_count++;
-			}
-			
-			free(data->current_prompt);
-			data->current_prompt = strdup(prompt);
-			free(data->current_response);
-			data->current_response = strdup("AI response would appear here");
-			
-			pthread_mutex_unlock(&data->lock);
-			break;
-		}
-	}
-	
-	free(panes);
 }
 
 void aiRender(editorPane *pane, struct abuf *ab) {
@@ -7645,1189 +7479,18 @@ void aiRender(editorPane *pane, struct abuf *ab) {
 	(void)ab;
 }
 
-/*** ai transport ***/
-static void hkHakoDirPath(char *out, size_t n) {
-	const char *home = getenv("HOME");
-	if (!home) { out[0] = '\0'; return; }
-	snprintf(out, n, "%s/.hako", home);
-#ifdef _WIN32
-	_mkdir(out);
-#else
-	mkdir(out, 0755);
-#endif
-}
+/*** claw pipe client ***/
 
-static int hkProjectDirPath(char *out, size_t n) {
-	char cwd[PATH_MAX];
-	if (!getcwd(cwd, sizeof(cwd))) return 0;
-	snprintf(out, n, "%s/.hako", cwd);
-	return 1;
-}
+/* Persistent subprocess: hako speaks JSONL over stdin/stdout to hakoc --pipe.
+   stdin  (to hakoc)   ← {"type":"prompt","text":"..."} | {"type":"slash","cmd":"..."} | {"type":"quit"}
+   stdout (from hakoc) → {"type":"init",...} | {"type":"message",...} | {"type":"tool_start/end",...} | {"type":"done",...} */
 
-static int hkProjectTrusted(void) {
-	char dir[PATH_MAX];
-	if (!hkProjectDirPath(dir, sizeof(dir))) return 0;
-	struct stat st;
-	if (stat(dir, &st) != 0 || !S_ISDIR(st.st_mode)) return 0;
-	char trust[PATH_MAX + 16];
-	snprintf(trust, sizeof(trust), "%s/trust", dir);
-	return (stat(trust, &st) == 0 && S_ISREG(st.st_mode)) ? 1 : 0;
-}
-
-static void hkHistoryPath(char *out, size_t n) {
-	if (hkProjectTrusted()) {
-		char dir[PATH_MAX];
-		hkProjectDirPath(dir, sizeof(dir));
-		snprintf(out, n, "%s/history", dir);
-		return;
-	}
-	char cwd[PATH_MAX];
-	if (getcwd(cwd, sizeof(cwd))) {
-		char local[PATH_MAX + 8];
-		snprintf(local, sizeof(local), "%s/.rei", cwd);
-		struct stat st;
-		if (stat(local, &st) == 0 && S_ISREG(st.st_mode)) {
-			snprintf(out, n, "%s", local);
-			return;
-		}
-	}
-	char dir[512];
-	hkHakoDirPath(dir, sizeof(dir));
-	snprintf(out, n, "%s/history", dir);
-}
-
-static int hkGrantProjectTrust(void) {
-	char dir[PATH_MAX];
-	if (!hkProjectDirPath(dir, sizeof(dir))) return 0;
-	mkdir(dir, 0755);
-	char trust[PATH_MAX + 16];
-	snprintf(trust, sizeof(trust), "%s/trust", dir);
-	FILE *fp = fopen(trust, "w");
-	if (!fp) return 0;
-	fprintf(fp, "granted=%ld\n", (long)time(NULL));
-	fclose(fp);
-	return 1;
-}
-
-static void hkJsonEscapeInto(const char *s, char *out, int cap) {
-	int j = 0;
-	for (int i = 0; s[i] && j < cap - 6; i++) {
-		unsigned char ch = (unsigned char)s[i];
-		if (ch == '"') { out[j++] = '\\'; out[j++] = '"'; }
-		else if (ch == '\\') { out[j++] = '\\'; out[j++] = '\\'; }
-		else if (ch == '\n') { out[j++] = '\\'; out[j++] = 'n'; }
-		else if (ch == '\r') { out[j++] = '\\'; out[j++] = 'r'; }
-		else if (ch == '\t') { out[j++] = '\\'; out[j++] = 't'; }
-		else if (ch < 0x20) { j += snprintf(out + j, cap - j, "\\u%04x", ch); }
-		else out[j++] = s[i];
-	}
-	out[j] = '\0';
-}
-
-void hkLogMessage(const char *role, const char *content) {
-	char path[512];
-	hkHistoryPath(path, sizeof(path));
-	if (!path[0]) return;
-	FILE *fp = fopen(path, "a");
-	if (!fp) return;
-	int clen = content ? (int)strlen(content) : 0;
-	int cap = clen * 6 + 32;
-	char *esc = malloc(cap);
-	if (!esc) { fclose(fp); return; }
-	hkJsonEscapeInto(content ? content : "", esc, cap);
-	fprintf(fp, "{\"ts\":%ld,\"sid\":\"%s\",\"role\":\"%s\",\"content\":\"%s\"}\n",
-		(long)time(NULL), E.session_id ? E.session_id : "", role, esc);
-	free(esc);
-	fclose(fp);
-}
-
-static char *hkJsonUnescape(const char *s, int len) {
-	char *out = malloc(len + 1);
-	if (!out) return NULL;
-	int j = 0;
-	for (int i = 0; i < len; i++) {
-		if (s[i] == '\\' && i + 1 < len) {
-			i++;
-			switch (s[i]) {
-			case 'n': out[j++] = '\n'; break;
-			case 'r': out[j++] = '\r'; break;
-			case 't': out[j++] = '\t'; break;
-			case '"': out[j++] = '"'; break;
-			case '\\': out[j++] = '\\'; break;
-			case '/': out[j++] = '/'; break;
-			default: out[j++] = s[i]; break;
-			}
-		} else out[j++] = s[i];
-	}
-	out[j] = '\0';
-	return out;
-}
-
-void aiAddHistory(aiData *data, const char *text);
-
-void hkLoadHistoryTail(aiData *data, int max_msgs) {
-	char path[512];
-	hkHistoryPath(path, sizeof(path));
-	if (!path[0]) return;
-	FILE *fp = fopen(path, "r");
-	if (!fp) return;
-
-	char **lines = NULL;
-	int lcount = 0, lcap = 0;
-	char *line = NULL;
-	size_t cap = 0;
-	ssize_t n;
-	while ((n = getline(&line, &cap, fp)) != -1) {
-		if (lcount >= lcap) { lcap = lcap ? lcap * 2 : 64; lines = realloc(lines, sizeof(char*) * lcap); }
-		lines[lcount++] = strndup(line, n);
-	}
-	free(line);
-	fclose(fp);
-
-	int kept = 0;
-	int *keep_idx = malloc(sizeof(int) * lcount);
-	for (int i = 0; i < lcount; i++) {
-		char *l = lines[i];
-		if (E.session_id) {
-			char tag[64];
-			snprintf(tag, sizeof(tag), "\"sid\":\"%s\"", E.session_id);
-			if (!strstr(l, tag)) continue;
-		}
-		keep_idx[kept++] = i;
-	}
-	int start = kept > max_msgs ? kept - max_msgs : 0;
-	for (int k = start; k < kept; k++) {
-		int i = keep_idx[k];
-		char *l = lines[i];
-		char *role = strstr(l, "\"role\":\"");
-		char *content = strstr(l, "\"content\":\"");
-		if (role && content) {
-			role += 8;
-			char *rend = strchr(role, '"');
-			content += 11;
-			char *cend = content;
-			while (*cend) {
-				if (*cend == '"' && *(cend - 1) != '\\') break;
-				cend++;
-			}
-			if (rend && cend > content) {
-				char rtag = *role;
-				char *text = hkJsonUnescape(content, cend - content);
-				if (text) {
-					unsigned char r = (rtag == 'u') ? HK_ROLE_USER
-						: (rtag == 'a') ? HK_ROLE_AI : HK_ROLE_SYSTEM;
-					aiAddHistoryRole(data, text, r);
-					free(text);
-				}
-			}
-		}
-	}
-	free(keep_idx);
-	for (int i = 0; i < lcount; i++) free(lines[i]);
-	free(lines);
-}
-
-int hkLoadSkills(aiData *data) {
-	if (!data) return 0;
-	char dir[512];
-	hkHakoDirPath(dir, sizeof(dir));
-	if (!dir[0]) return 0;
-	char skills[512];
-	snprintf(skills, sizeof(skills), "%s/skills", dir);
-	DIR *d = opendir(skills);
-	if (!d) return 0;
-
-	enum { MAX_SKILLS = 64, MAX_TOTAL = 1u << 20 }; /* 1 MiB cap on system prompt */
-	char *buf = NULL;
-	size_t total = 0;
-	int loaded = 0;
-	struct dirent *e;
-	while ((e = readdir(d)) && loaded < MAX_SKILLS) {
-		if (e->d_name[0] == '.') continue;
-		int nlen = strlen(e->d_name);
-		if (nlen < 4 || strcmp(e->d_name + nlen - 3, ".md") != 0) continue;
-		char path[1024];
-		snprintf(path, sizeof(path), "%s/%s", skills, e->d_name);
-		FILE *fp = fopen(path, "r");
-		if (!fp) continue;
-		fseek(fp, 0, SEEK_END);
-		long sz = ftell(fp);
-		fseek(fp, 0, SEEK_SET);
-		if (sz < 0 || sz > 200000) { fclose(fp); continue; }
-		char header[256];
-		int hlen = snprintf(header, sizeof(header), "\n<skill name=\"%s\">\n", e->d_name);
-		const char *tail = "\n</skill>\n";
-		int tlen = (int)strlen(tail);
-		size_t need = total + (size_t)hlen + (size_t)sz + (size_t)tlen + 1;
-		if (need > MAX_TOTAL) { fclose(fp); break; }
-		char *nb = realloc(buf, need);
-		if (!nb) { fclose(fp); break; }
-		buf = nb;
-		memcpy(buf + total, header, hlen); total += hlen;
-		size_t got = fread(buf + total, 1, (size_t)sz, fp);
-		total += got;
-		memcpy(buf + total, tail, tlen); total += tlen;
-		fclose(fp);
-		loaded++;
-	}
-	closedir(d);
-	if (buf) buf[total] = '\0';
-
-	free(data->system_prompt);
-	data->system_prompt = buf;
-	return loaded;
-}
-
-const char *hkProviderName(enum aiProviderType t) {
-	switch (t) {
-	case AI_PROVIDER_OLLAMA: return "ollama";
-	case AI_PROVIDER_ANTHROPIC: return "anthropic";
-	case AI_PROVIDER_OPENAI: return "openai";
-	default: return "none";
-	}
-}
-
-static enum aiProviderType hkParseProvider(const char *s) {
-	if (strcmp(s, "ollama") == 0) return AI_PROVIDER_OLLAMA;
-	if (strcmp(s, "anthropic") == 0 || strcmp(s, "claude") == 0) return AI_PROVIDER_ANTHROPIC;
-	if (strcmp(s, "openai") == 0 || strcmp(s, "gpt") == 0 || strcmp(s, "groq") == 0) return AI_PROVIDER_OPENAI;
-	if (strcmp(s, "deepseek") == 0 || strcmp(s, "mistral") == 0 || strcmp(s, "together") == 0
-		|| strcmp(s, "fireworks") == 0 || strcmp(s, "openrouter") == 0
-		|| strcmp(s, "xai") == 0 || strcmp(s, "grok") == 0) return AI_PROVIDER_OPENAI;
-	return AI_PROVIDER_NONE;
-}
-
-static const char *hkProviderDefaultEndpoint(const char *s) {
-	if (strcmp(s, "deepseek") == 0)   return "https://api.deepseek.com";
-	if (strcmp(s, "mistral") == 0)    return "https://api.mistral.ai";
-	if (strcmp(s, "together") == 0)   return "https://api.together.xyz";
-	if (strcmp(s, "fireworks") == 0)  return "https://api.fireworks.ai/inference";
-	if (strcmp(s, "openrouter") == 0) return "https://openrouter.ai/api";
-	if (strcmp(s, "groq") == 0)       return "https://api.groq.com/openai";
-	if (strcmp(s, "xai") == 0 || strcmp(s, "grok") == 0) return "https://api.x.ai";
-	return NULL;
-}
-
-static void hkApplyProviderAlias(const char *val) {
-	enum aiProviderType t = hkParseProvider(val);
-	if (t == AI_PROVIDER_NONE) return;
-	E.ai_provider_type = t;
-	const char *ep = hkProviderDefaultEndpoint(val);
-	if (ep && !E.ai_endpoint) E.ai_endpoint = strdup(ep);
-}
-
-static void hkWriteSessionFile(const char *path) {
-	FILE *fp = fopen(path, "w");
-	if (!fp) return;
-	fprintf(fp, "ai_provider=%s\n", hkProviderName(E.ai_provider_type));
-	if (E.ai_model) fprintf(fp, "ai_model=%s\n", E.ai_model);
-	if (E.ai_endpoint) fprintf(fp, "ai_endpoint=%s\n", E.ai_endpoint);
-	fprintf(fp, "ai_tools_enabled=%d\n", E.ai_tools_enabled);
-	fprintf(fp, "ai_stream=%d\n", E.ai_stream);
-	fprintf(fp, "ai_autowrite=%d\n", E.ai_autowrite);
-	if (E.session_id) fprintf(fp, "session_id=%s\n", E.session_id);
-	fprintf(fp, "session_started=%ld\n", E.session_started);
-	fprintf(fp, "session_last_used=%ld\n", (long)time(NULL));
-	fprintf(fp, "session_turn_count=%d\n", E.session_turn_count);
-	fclose(fp);
-}
-
-void hkSaveSession(void) {
-	char dir[512];
-	hkHakoDirPath(dir, sizeof(dir));
-	if (dir[0]) {
-		char path[640];
-		snprintf(path, sizeof(path), "%s/state", dir);
-		hkWriteSessionFile(path);
-	}
-	char pdir[PATH_MAX];
-	if (hkProjectDirPath(pdir, sizeof(pdir))) {
-		char ppath[PATH_MAX + 8];
-		snprintf(ppath, sizeof(ppath), "%s/state", pdir);
-		hkWriteSessionFile(ppath);
-	}
-}
-
-static void hkLoadSessionFile(const char *path, int allow_session_fields) {
-	FILE *fp = fopen(path, "r");
-	if (!fp) return;
-	char *line = NULL;
-	size_t cap = 0;
-	while (getline(&line, &cap, fp) != -1) {
-		char *nl = strchr(line, '\n'); if (nl) *nl = '\0';
-		char *eq = strchr(line, '='); if (!eq) continue;
-		*eq = '\0';
-		char *key = line, *val = eq + 1;
-		if (strcmp(key, "ai_provider") == 0) {
-			enum aiProviderType t = hkParseProvider(val);
-			if (t != AI_PROVIDER_NONE) E.ai_provider_type = t;
-		} else if (strcmp(key, "ai_model") == 0) {
-			free(E.ai_model);
-			E.ai_model = strdup(val);
-		} else if (strcmp(key, "ai_endpoint") == 0) {
-			free(E.ai_endpoint);
-			E.ai_endpoint = strdup(val);
-		} else if (strcmp(key, "ai_tools_enabled") == 0) {
-			E.ai_tools_enabled = atoi(val) ? 1 : 0;
-		} else if (strcmp(key, "ai_stream") == 0) {
-			E.ai_stream = atoi(val) ? 1 : 0;
-		} else if (strcmp(key, "ai_autowrite") == 0) {
-			E.ai_autowrite = atoi(val) ? 1 : 0;
-		} else if (allow_session_fields && strcmp(key, "session_id") == 0) {
-			free(E.session_id);
-			E.session_id = strdup(val);
-		} else if (allow_session_fields && strcmp(key, "session_started") == 0) {
-			E.session_started = atol(val);
-		} else if (allow_session_fields && strcmp(key, "session_last_used") == 0) {
-			E.session_last_used = atol(val);
-		} else if (allow_session_fields && strcmp(key, "session_turn_count") == 0) {
-			E.session_turn_count = atoi(val);
-		}
-	}
-	free(line);
-	fclose(fp);
-}
-
-static void hkGenSessionId(void) {
-	free(E.session_id);
-	E.session_id = malloc(17);
-	long now = (long)time(NULL);
-	srand((unsigned)(now ^ getpid()));
-	snprintf(E.session_id, 17, "%lx%04x", now & 0xffffffff, rand() & 0xffff);
-}
-
-void hkLoadSession(void) {
-	char dir[512];
-	hkHakoDirPath(dir, sizeof(dir));
-	if (dir[0]) {
-		char path[640];
-		snprintf(path, sizeof(path), "%s/state", dir);
-		hkLoadSessionFile(path, 0);
-	}
-	char pdir[PATH_MAX];
-	int has_project = 0;
-	char ppath[PATH_MAX + 8];
-	if (hkProjectDirPath(pdir, sizeof(pdir))) {
-		struct stat st;
-		snprintf(ppath, sizeof(ppath), "%s/state", pdir);
-		if (stat(ppath, &st) == 0) {
-			has_project = 1;
-			hkLoadSessionFile(ppath, 1);
-		}
-	}
-
-	long now = (long)time(NULL);
-	int recent = E.session_last_used > 0 && (now - E.session_last_used) < 7 * 24 * 3600;
-	if (has_project && E.session_id && recent) {
-		E.session_resumed = 1;
-	} else {
-		E.session_resumed = 0;
-		E.session_started = now;
-		E.session_last_used = 0;
-		E.session_turn_count = 0;
-		hkGenSessionId();
-	}
-}
-
-int hkHandleSlash(aiData *data, const char *prompt) {
-	if (prompt[0] != '/') return 0;
-	const char *cmd = prompt + 1;
-	const char *arg = strchr(cmd, ' ');
-	int cmdlen = arg ? (arg - cmd) : (int)strlen(cmd);
-	if (arg) { while (*arg == ' ') arg++; }
-
-	if (strncmp(cmd, "help", cmdlen) == 0 && cmdlen == 4) {
-		aiAddHistory(data, "/clear  /help  /model <id>  /provider <name>");
-		aiAddHistory(data, "/file <path>  /history [local|global]  /skills [reload]");
-		aiAddHistory(data, "/skill install <url>  /skill uninstall <name>");
-		aiAddHistory(data, "/tools on|off  /trust [revoke]  /usage  /quit");
-		aiAddHistory(data, "/sessions  /resume <id>  /session [new]");
-		return 1;
-	}
-	if (strncmp(cmd, "clear", cmdlen) == 0 && cmdlen == 5) {
-		for (int i = 0; i < data->history_count; i++) free(data->history[i]);
-		memset(data->history_role, 0, AI_HISTORY_MAX);
-		data->history_count = 0;
-		data->cursor_y = data->history_pos = 0;
-		aiAddHistory(data, "(cleared)");
-		return 1;
-	}
-	if (strncmp(cmd, "model", cmdlen) == 0 && cmdlen == 5) {
-		if (arg && *arg) {
-			free(E.ai_model);
-			E.ai_model = strdup(arg);
-			hkSaveSession();
-			char msg[256];
-			snprintf(msg, sizeof(msg), "model: %s (saved)", E.ai_model);
-			aiAddHistory(data, msg);
-		} else {
-			char msg[256];
-			snprintf(msg, sizeof(msg), "model: %s", E.ai_model ? E.ai_model : "(unset)");
-			aiAddHistory(data, msg);
-		}
-		return 1;
-	}
-	if (strncmp(cmd, "provider", cmdlen) == 0 && cmdlen == 8) {
-		if (arg && *arg) {
-			enum aiProviderType t = hkParseProvider(arg);
-			if (t == AI_PROVIDER_NONE) {
-				aiAddHistory(data, "unknown (ollama/anthropic/openai/groq/deepseek/mistral/together/fireworks/openrouter/xai)");
-			} else {
-				hkApplyProviderAlias(arg);
-				hkSaveSession();
-				char msg[256];
-				snprintf(msg, sizeof(msg), "provider: %s (saved)%s%s",
-					hkProviderName(t),
-					hkProviderDefaultEndpoint(arg) ? " endpoint=" : "",
-					hkProviderDefaultEndpoint(arg) ? hkProviderDefaultEndpoint(arg) : "");
-				aiAddHistory(data, msg);
-			}
-		} else {
-			char msg[256];
-			snprintf(msg, sizeof(msg), "provider: %s", hkProviderName(E.ai_provider_type));
-			aiAddHistory(data, msg);
-		}
-		return 1;
-	}
-	if (strncmp(cmd, "file", cmdlen) == 0 && cmdlen == 4) {
-		if (!arg || !*arg) { aiAddHistory(data, "usage: /file <path>"); return 1; }
-		FILE *fp = fopen(arg, "r");
-		if (!fp) { aiAddHistory(data, "file not found"); return 1; }
-		fseek(fp, 0, SEEK_END);
-		long sz = ftell(fp);
-		fseek(fp, 0, SEEK_SET);
-		if (sz < 0 || sz > 200000) { fclose(fp); aiAddHistory(data, "file too large"); return 1; }
-		char *buf = malloc(sz + 1);
-		fread(buf, 1, sz, fp);
-		buf[sz] = '\0';
-		fclose(fp);
-		char header[512];
-		snprintf(header, sizeof(header), "injected file: %s (%ld bytes)", arg, sz);
-		aiAddHistory(data, header);
-		free(data->current_prompt);
-		int need = sz + strlen(arg) + 128;
-		data->current_prompt = malloc(need);
-		snprintf(data->current_prompt, need, "<file path=\"%s\">\n%s\n</file>\n", arg, buf);
-		free(buf);
-		aiWorkerSend(data);
-		return 1;
-	}
-	if (strncmp(cmd, "history", cmdlen) == 0 && cmdlen == 7) {
-		if (arg && strcmp(arg, "local") == 0) {
-			char cwd[PATH_MAX];
-			if (!getcwd(cwd, sizeof(cwd))) { aiAddHistory(data, "cwd error"); return 1; }
-			char local[PATH_MAX + 8];
-			snprintf(local, sizeof(local), "%s/.rei", cwd);
-			struct stat st;
-			if (stat(local, &st) != 0) {
-				FILE *fp = fopen(local, "w");
-				if (!fp) { aiAddHistory(data, "cannot create .rei"); return 1; }
-				fclose(fp);
-				aiAddHistory(data, "created .rei in cwd");
-			} else {
-				aiAddHistory(data, ".rei already exists");
-			}
-			char msg[PATH_MAX + 16];
-			snprintf(msg, sizeof(msg), "using: %s", local);
-			aiAddHistory(data, msg);
-			return 1;
-		}
-		if (arg && strcmp(arg, "global") == 0) {
-			char cwd[PATH_MAX];
-			if (getcwd(cwd, sizeof(cwd))) {
-				char local[PATH_MAX + 8];
-				snprintf(local, sizeof(local), "%s/.rei", cwd);
-				if (unlink(local) == 0) aiAddHistory(data, "removed local .rei");
-				else aiAddHistory(data, "no local .rei to remove");
-			}
-			char p[512];
-			hkHistoryPath(p, sizeof(p));
-			char msg[600];
-			snprintf(msg, sizeof(msg), "using: %s", p);
-			aiAddHistory(data, msg);
-			return 1;
-		}
-		char p[512];
-		hkHistoryPath(p, sizeof(p));
-		aiAddHistory(data, p);
-		aiAddHistory(data, "(use /history local | /history global)");
-		return 1;
-	}
-	if (strncmp(cmd, "skills", cmdlen) == 0 && cmdlen == 6) {
-		if (arg && strncmp(arg, "reload", 6) == 0) {
-			int n = hkLoadSkills(data);
-			char msg[64];
-			snprintf(msg, sizeof(msg), "reloaded %d skill(s)", n);
-			aiAddHistory(data, msg);
-			return 1;
-		}
-		char dir[512];
-		hkHakoDirPath(dir, sizeof(dir));
-		char skills[512];
-		snprintf(skills, sizeof(skills), "%s/skills", dir);
-		DIR *d = opendir(skills);
-		if (!d) { aiAddHistory(data, "no skills dir (~/.hako/skills)"); return 1; }
-		struct dirent *e;
-		int n = 0;
-		while ((e = readdir(d))) {
-			if (e->d_name[0] == '.') continue;
-			aiAddHistory(data, e->d_name);
-			n++;
-		}
-		closedir(d);
-		if (n == 0) aiAddHistory(data, "(no skills)");
-		return 1;
-	}
-	if (strncmp(cmd, "skill", cmdlen) == 0 && cmdlen == 5) {
-		if (arg && strncmp(arg, "uninstall ", 10) == 0) {
-			const char *name = arg + 10;
-			while (*name == ' ') name++;
-			if (!*name) { aiAddHistory(data, "usage: /skill uninstall <name>"); return 1; }
-			char dir[512];
-			hkHakoDirPath(dir, sizeof(dir));
-			char path[1024];
-			int nlen = strlen(name);
-			if (nlen >= 4 && strcmp(name + nlen - 3, ".md") == 0) {
-				snprintf(path, sizeof(path), "%s/skills/%s", dir, name);
-			} else {
-				snprintf(path, sizeof(path), "%s/skills/%s.md", dir, name);
-			}
-			if (unlink(path) == 0) {
-				int n = hkLoadSkills(data);
-				char msg[128];
-				snprintf(msg, sizeof(msg), "uninstalled: %s (%d remain)", name, n);
-				aiAddHistory(data, msg);
-			} else {
-				aiAddHistory(data, "skill not found");
-			}
-			return 1;
-		}
-		if (!arg || strncmp(arg, "install ", 8) != 0) {
-			aiAddHistory(data, "usage: /skill install <url>  |  /skill uninstall <name>");
-			return 1;
-		}
-		const char *url = arg + 8;
-		while (*url == ' ') url++;
-		if (!*url) { aiAddHistory(data, "usage: /skill install <url>"); return 1; }
-		char dir[512];
-		hkHakoDirPath(dir, sizeof(dir));
-		char skills[512];
-		snprintf(skills, sizeof(skills), "%s/skills", dir);
-		mkdir(dir, 0755);
-		mkdir(skills, 0755);
-		const char *slash = strrchr(url, '/');
-		const char *name = slash ? slash + 1 : url;
-		char outpath[1024];
-		snprintf(outpath, sizeof(outpath), "%s/%s", skills, name);
-		int nlen = strlen(name);
-		if (nlen < 4 || strcmp(name + nlen - 3, ".md") != 0) {
-			snprintf(outpath, sizeof(outpath), "%s/%s.md", skills, name);
-		}
-		char cmdbuf[2048];
-		snprintf(cmdbuf, sizeof(cmdbuf), "curl -sfL -o %s %s", outpath, url);
-		int rc = system(cmdbuf);
-		if (rc != 0) { aiAddHistory(data, "download failed"); return 1; }
-		int n = hkLoadSkills(data);
-		char msg[128];
-		snprintf(msg, sizeof(msg), "installed: %s (%d total)", name, n);
-		aiAddHistory(data, msg);
-		return 1;
-	}
-	if (strncmp(cmd, "tools", cmdlen) == 0 && cmdlen == 5) {
-		int changed = 0;
-		if (arg && strcmp(arg, "on") == 0) { E.ai_tools_enabled = 1; changed = 1; }
-		else if (arg && strcmp(arg, "off") == 0) { E.ai_tools_enabled = 0; changed = 1; }
-		if (changed) hkSaveSession();
-		char msg[64];
-		snprintf(msg, sizeof(msg), "tools: %s%s", E.ai_tools_enabled ? "on" : "off", changed ? " (saved)" : "");
-		aiAddHistory(data, msg);
-		return 1;
-	}
-	if (strncmp(cmd, "trust", cmdlen) == 0 && cmdlen == 5) {
-		if (arg && strcmp(arg, "revoke") == 0) {
-			char dir[PATH_MAX];
-			hkProjectDirPath(dir, sizeof(dir));
-			char trust[PATH_MAX + 16];
-			snprintf(trust, sizeof(trust), "%s/trust", dir);
-			if (unlink(trust) == 0) aiAddHistory(data, "trust revoked");
-			else aiAddHistory(data, "no trust to revoke");
-			return 1;
-		}
-		if (hkProjectTrusted()) {
-			aiAddHistory(data, "already trusted");
-		} else if (hkGrantProjectTrust()) {
-			aiAddHistory(data, "trusted. Rei may edit files.");
-		} else {
-			aiAddHistory(data, "could not grant trust");
-		}
-		return 1;
-	}
-	if (strncmp(cmd, "quit", cmdlen) == 0 && cmdlen == 4) {
-		return 2;
-	}
-	if (strncmp(cmd, "usage", cmdlen) == 0 && cmdlen == 5) {
-		char msg[256];
-		snprintf(msg, sizeof(msg), "provider: %s", hkProviderName(E.ai_provider_type));
-		aiAddHistory(data, msg);
-		snprintf(msg, sizeof(msg), "model:    %s", E.ai_model ? E.ai_model : "(unset)");
-		aiAddHistory(data, msg);
-		snprintf(msg, sizeof(msg), "tools:    %s", E.ai_tools_enabled ? "on" : "off");
-		aiAddHistory(data, msg);
-		snprintf(msg, sizeof(msg), "trust:    %s", hkProjectTrusted() ? "granted" : "not granted");
-		aiAddHistory(data, msg);
-		snprintf(msg, sizeof(msg), "skills:   %d loaded", hkLoadSkills(data));
-		aiAddHistory(data, msg);
-		snprintf(msg, sizeof(msg), "stream:   %s", E.ai_stream ? "on" : "off");
-		aiAddHistory(data, msg);
-		snprintf(msg, sizeof(msg), "session:  %s (%d turns)",
-			E.session_id ? E.session_id : "(none)", E.session_turn_count);
-		aiAddHistory(data, msg);
-		char hpath[PATH_MAX];
-		hkHistoryPath(hpath, sizeof(hpath));
-		snprintf(msg, sizeof(msg), "history:  %s", hpath);
-		aiAddHistory(data, msg);
-		snprintf(msg, sizeof(msg), "tokens:   last %d in / %d out  total %ld in / %ld out (cap %d)",
-			data->last_in_tokens, data->last_out_tokens,
-			data->total_in_tokens, data->total_out_tokens, E.ai_max_tokens);
-		aiAddHistory(data, msg);
-		return 1;
-	}
-	if (strncmp(cmd, "sessions", cmdlen) == 0 && cmdlen == 8) {
-		char path[512];
-		hkHistoryPath(path, sizeof(path));
-		FILE *fp = fopen(path, "r");
-		if (!fp) { aiAddHistory(data, "(no history)"); return 1; }
-		char ids[16][32];
-		long lasts[16];
-		int counts[16];
-		char firsts[16][80];
-		int n = 0;
-		char *line = NULL;
-		size_t cap = 0;
-		while (getline(&line, &cap, fp) != -1) {
-			char *sidp = strstr(line, "\"sid\":\"");
-			if (!sidp) continue;
-			sidp += 7;
-			char *send = strchr(sidp, '"');
-			if (!send) continue;
-			char id[32];
-			int idlen = send - sidp;
-			if (idlen >= (int)sizeof(id)) idlen = sizeof(id) - 1;
-			memcpy(id, sidp, idlen); id[idlen] = '\0';
-			if (!*id) continue;
-			char *tsp = strstr(line, "\"ts\":");
-			long ts = tsp ? atol(tsp + 5) : 0;
-			int idx = -1;
-			for (int i = 0; i < n; i++) if (strcmp(ids[i], id) == 0) { idx = i; break; }
-			if (idx < 0) {
-				if (n >= 16) continue;
-				idx = n++;
-				snprintf(ids[idx], sizeof(ids[idx]), "%s", id);
-				firsts[idx][0] = '\0';
-				counts[idx] = 0;
-				char *role = strstr(line, "\"role\":\"user\"");
-				if (role) {
-					char *cp = strstr(line, "\"content\":\"");
-					if (cp) {
-						cp += 11;
-						int j = 0;
-						while (*cp && *cp != '"' && j < 60) firsts[idx][j++] = *cp++;
-						firsts[idx][j] = '\0';
-					}
-				}
-			}
-			counts[idx]++;
-			lasts[idx] = ts;
-		}
-		free(line); fclose(fp);
-		if (n == 0) { aiAddHistory(data, "(no sessions)"); return 1; }
-		long now = (long)time(NULL);
-		for (int i = 0; i < n; i++) {
-			long age = now - lasts[i];
-			char unit; long val;
-			if (age < 3600) { val = age / 60; unit = 'm'; }
-			else if (age < 86400) { val = age / 3600; unit = 'h'; }
-			else { val = age / 86400; unit = 'd'; }
-			char msg[200];
-			const char *cur = (E.session_id && strcmp(E.session_id, ids[i]) == 0) ? "* " : "  ";
-			snprintf(msg, sizeof(msg), "%s%s %ld%c %dt %.40s", cur, ids[i], val, unit, counts[i], firsts[i]);
-			aiAddHistory(data, msg);
-		}
-		aiAddHistory(data, "(/resume <id> to switch)");
-		return 1;
-	}
-	if (strncmp(cmd, "resume", cmdlen) == 0 && cmdlen == 6) {
-		if (!arg || !*arg) { aiAddHistory(data, "usage: /resume <id>"); return 1; }
-		free(E.session_id);
-		E.session_id = strdup(arg);
-		E.session_resumed = 1;
-		E.session_started = (long)time(NULL);
-		hkSaveSession();
-		for (int i = 0; i < data->history_count; i++) free(data->history[i]);
-		memset(data->history_role, 0, AI_HISTORY_MAX);
-		data->history_count = 0;
-		data->cursor_y = data->history_pos = 0;
-		aiFreeMessages(data);
-		char msg[128];
-		snprintf(msg, sizeof(msg), "resumed: %s", E.session_id);
-		aiAddHistory(data, msg);
-		hkLoadHistoryTail(data, 200);
-		return 1;
-	}
-	if (strncmp(cmd, "session", cmdlen) == 0 && cmdlen == 7) {
-		if (arg && strcmp(arg, "new") == 0) {
-			for (int i = 0; i < data->history_count; i++) free(data->history[i]);
-			memset(data->history_role, 0, AI_HISTORY_MAX);
-			data->history_count = 0;
-			data->cursor_y = data->history_pos = 0;
-			aiFreeMessages(data);
-			E.session_started = (long)time(NULL);
-			E.session_turn_count = 0;
-			E.session_resumed = 0;
-			hkGenSessionId();
-			hkSaveSession();
-			char msg[128];
-			snprintf(msg, sizeof(msg), "new session: %s", E.session_id);
-			aiAddHistory(data, msg);
-			return 1;
-		}
-		char msg[256];
-		snprintf(msg, sizeof(msg), "id:      %s", E.session_id ? E.session_id : "(none)");
-		aiAddHistory(data, msg);
-		long age = (long)time(NULL) - E.session_started;
-		snprintf(msg, sizeof(msg), "started: %ld min ago", age / 60);
-		aiAddHistory(data, msg);
-		snprintf(msg, sizeof(msg), "turns:   %d", E.session_turn_count);
-		aiAddHistory(data, msg);
-		snprintf(msg, sizeof(msg), "state:   %s", E.session_resumed ? "resumed" : "new");
-		aiAddHistory(data, msg);
-		aiAddHistory(data, "(/session new to reset)");
-		return 1;
-	}
-	aiAddHistory(data, "unknown command (/help)");
-	return 1;
-}
-
-static void aiPushHistoryLine(aiData *data, const char *text, int len, unsigned char role) {
-	if (data->history_count >= AI_HISTORY_MAX) return;
-	char *line = malloc(len + 1);
-	if (!line) return;
-	memcpy(line, text, len);
-	line[len] = '\0';
-	data->history_role[data->history_count] = role;
-	data->history[data->history_count++] = line;
-}
-
-static void aiAddHistoryLine(aiData *data, const char *text, int text_len, unsigned char role) {
-	int max_width = 60;
-	if (text_len <= 0) {
-		aiPushHistoryLine(data, "", 0, role);
-		return;
-	}
-	if (text_len <= max_width) {
-		aiPushHistoryLine(data, text, text_len, role);
-		return;
-	}
-	int pos = 0;
-	while (pos < text_len) {
-		if (data->history_count >= AI_HISTORY_MAX) break;
-		int end = pos + max_width;
-		if (end >= text_len) {
-			aiPushHistoryLine(data, text + pos, text_len - pos, role);
-			break;
-		}
-		int wrap = end;
-		while (wrap > pos && text[wrap] != ' ') wrap--;
-		if (wrap == pos) wrap = end;
-		aiPushHistoryLine(data, text + pos, wrap - pos, role);
-		pos = wrap;
-		while (pos < text_len && text[pos] == ' ') pos++;
-	}
-}
-
-void aiAddHistoryRole(aiData *data, const char *text, unsigned char role) {
-	if (!data || !text) return;
-	if (data->history_count > 0 && data->history_count < AI_HISTORY_MAX - 1) {
-		unsigned char prev = data->history_role[data->history_count - 1];
-		int role_swap = (prev != role) && (prev == HK_ROLE_USER || prev == HK_ROLE_AI || role == HK_ROLE_USER || role == HK_ROLE_AI);
-		char *prev_text = data->history[data->history_count - 1];
-		if (role_swap && prev_text && *prev_text != '\0') {
-			aiPushHistoryLine(data, "", 0, HK_ROLE_SYSTEM);
-		}
-	}
-	const char *p = text;
-	while (1) {
-		const char *nl = strchr(p, '\n');
-		int seg = nl ? (int)(nl - p) : (int)strlen(p);
-		aiAddHistoryLine(data, p, seg, role);
-		if (!nl) break;
-		p = nl + 1;
-	}
-}
-
-void aiAddHistory(aiData *data, const char *text) {
-	aiAddHistoryRole(data, text, HK_ROLE_SYSTEM);
-}
-
-void aiPushMessage(aiData *data, const char *role, const char *content) {
-	if (!data || !role || !content) return;
-	if (data->message_count >= data->message_cap) {
-		data->message_cap = data->message_cap ? data->message_cap * 2 : 16;
-		data->messages = realloc(data->messages, sizeof(aiMessage) * data->message_cap);
-	}
-	data->messages[data->message_count].role = strdup(role);
-	data->messages[data->message_count].content = strdup(content);
-	data->messages[data->message_count].raw = 0;
-	data->message_count++;
-}
-
-void aiPushMessageRaw(aiData *data, const char *role, const char *content_json) {
-	if (!data || !role || !content_json) return;
-	if (data->message_count >= data->message_cap) {
-		data->message_cap = data->message_cap ? data->message_cap * 2 : 16;
-		data->messages = realloc(data->messages, sizeof(aiMessage) * data->message_cap);
-	}
-	data->messages[data->message_count].role = strdup(role);
-	data->messages[data->message_count].content = strdup(content_json);
-	data->messages[data->message_count].raw = 1;
-	data->message_count++;
-}
-
-void aiFreeMessages(aiData *data) {
-	if (!data || !data->messages) return;
-	for (int i = 0; i < data->message_count; i++) {
-		free(data->messages[i].role);
-		free(data->messages[i].content);
-	}
-	free(data->messages);
-	data->messages = NULL;
-	data->message_count = 0;
-	data->message_cap = 0;
-}
-
-static char *aiBuildMessagesJson(aiData *data) {
-	int cap = 4096;
-	char *out = malloc(cap);
-	if (!out) return NULL;
-	int len = 0;
-	out[len++] = '[';
-	for (int i = 0; i < data->message_count; i++) {
-		const char *content = data->messages[i].content ? data->messages[i].content : "";
-		int clen = strlen(content);
-		int need = len + clen * 6 + 128;
-		if (need >= cap) {
-			while (cap < need) cap *= 2;
-			out = realloc(out, cap);
-			if (!out) return NULL;
-		}
-		if (i > 0) out[len++] = ',';
-		if (data->messages[i].raw) {
-			int need2 = len + clen + 64;
-			if (need2 >= cap) { while (cap < need2) cap *= 2; out = realloc(out, cap); }
-			len += snprintf(out + len, cap - len, "{\"role\":\"%s\",\"content\":", data->messages[i].role);
-			memcpy(out + len, content, clen);
-			len += clen;
-			out[len++] = '}';
-		} else {
-			len += snprintf(out + len, cap - len, "{\"role\":\"%s\",\"content\":\"", data->messages[i].role);
-			char *esc = malloc(clen * 6 + 8);
-			hkJsonEscapeInto(content, esc, clen * 6 + 8);
-			int elen = strlen(esc);
-			if (len + elen + 8 >= cap) {
-				cap = (len + elen) * 2;
-				out = realloc(out, cap);
-			}
-			memcpy(out + len, esc, elen);
-			len += elen;
-			free(esc);
-			out[len++] = '"';
-			out[len++] = '}';
-		}
-	}
-	out[len++] = ']';
-	out[len] = '\0';
-	return out;
-}
-
-static char *aiWriteRequestFile(const char *json) {
-	char path[256];
-	snprintf(path, sizeof(path), "/tmp/hako-req-%d.json", (int)getpid());
-	FILE *fp = fopen(path, "w");
-	if (!fp) return NULL;
-	fputs(json, fp);
-	fclose(fp);
-	return strdup(path);
-}
-
-static char *hkBuildToolsSchema(int provider_format);
-
-char *aiBuildCurlCommand(aiData *data, enum aiProviderType type) {
-	char *msgs = aiBuildMessagesJson(data);
-	if (!msgs) return NULL;
-
-	const char *endpoint = E.ai_endpoint;
-	const char *model = E.ai_model;
-	const char *api_key = E.ai_api_key;
-	int max_tokens = E.ai_max_tokens > 0 ? E.ai_max_tokens : 2048;
-
-	int bodycap = strlen(msgs) + 4096;
-	char *body = malloc(bodycap);
-	if (!body) { free(msgs); return NULL; }
-
-	const char *sys = (data->system_prompt && *data->system_prompt) ? data->system_prompt : "";
-	char *sys_esc = NULL;
-	if (*sys) {
-		int slen = strlen(sys);
-		sys_esc = malloc(slen * 6 + 8);
-		hkJsonEscapeInto(sys, sys_esc, slen * 6 + 8);
-	}
-
-	int tools_on = E.ai_tools_enabled;
-	char *anth_tools = NULL, *fn_tools = NULL;
-	if (tools_on) {
-		anth_tools = hkBuildToolsSchema(0);
-		fn_tools = hkBuildToolsSchema(1);
-	}
-
-	switch (type) {
-	case AI_PROVIDER_OLLAMA: {
-		if (!endpoint) endpoint = "http://localhost:11434";
-		if (!model) model = "llama3.2";
-		int tlen = tools_on ? strlen(fn_tools) + 16 : 0;
-		int need = bodycap + tlen + 96;
-		if (need > bodycap) { body = realloc(body, need); bodycap = need; }
-		if (tools_on) {
-			snprintf(body, bodycap,
-				"{\"model\":\"%s\",\"messages\":%s,\"stream\":false,\"tools\":%s}",
-				model, msgs, fn_tools);
-		} else {
-			snprintf(body, bodycap,
-				"{\"model\":\"%s\",\"messages\":%s,\"stream\":false}",
-				model, msgs);
-		}
-		break;
-	}
-	case AI_PROVIDER_ANTHROPIC: {
-		if (!endpoint) endpoint = "https://api.anthropic.com";
-		if (!model) model = "claude-sonnet-4-20250514";
-		int anth_on = tools_on && hkProjectTrusted();
-		int stream_on = E.ai_stream && !anth_on;
-		int tlen = anth_on ? strlen(anth_tools) + 16 : 0;
-		int need = bodycap + tlen + 96;
-		if (need > bodycap) { body = realloc(body, need); bodycap = need; }
-		const char *stream_field = stream_on ? ",\"stream\":true" : "";
-		char tools_field[64];
-		tools_field[0] = '\0';
-		if (*sys) {
-			if (anth_on) {
-				snprintf(body, bodycap,
-					"{\"model\":\"%s\",\"max_tokens\":%d,\"system\":\"%s\",\"messages\":%s,\"tools\":%s%s}",
-					model, max_tokens, sys_esc, msgs, anth_tools, stream_field);
-			} else {
-				snprintf(body, bodycap,
-					"{\"model\":\"%s\",\"max_tokens\":%d,\"system\":\"%s\",\"messages\":%s%s}",
-					model, max_tokens, sys_esc, msgs, stream_field);
-			}
-		} else {
-			if (anth_on) {
-				snprintf(body, bodycap,
-					"{\"model\":\"%s\",\"max_tokens\":%d,\"messages\":%s,\"tools\":%s%s}",
-					model, max_tokens, msgs, anth_tools, stream_field);
-			} else {
-				snprintf(body, bodycap,
-					"{\"model\":\"%s\",\"max_tokens\":%d,\"messages\":%s%s}",
-					model, max_tokens, msgs, stream_field);
-			}
-		}
-		(void)tools_field;
-		break;
-	}
-	case AI_PROVIDER_OPENAI: {
-		if (!endpoint) endpoint = "https://api.openai.com";
-		if (!model) model = "gpt-4o-mini";
-		int tlen = tools_on ? strlen(fn_tools) + 16 : 0;
-		int need = bodycap + tlen + 96;
-		if (need > bodycap) { body = realloc(body, need); bodycap = need; }
-		if (tools_on) {
-			snprintf(body, bodycap,
-				"{\"model\":\"%s\",\"max_tokens\":%d,\"messages\":%s,\"tools\":%s}",
-				model, max_tokens, msgs, fn_tools);
-		} else {
-			snprintf(body, bodycap,
-				"{\"model\":\"%s\",\"max_tokens\":%d,\"messages\":%s}",
-				model, max_tokens, msgs);
-		}
-		break;
-	}
-	default:
-		free(body); free(msgs); free(sys_esc); free(anth_tools); free(fn_tools); return NULL;
-	}
-
-	free(msgs);
-	free(sys_esc);
-	free(anth_tools);
-	free(fn_tools);
-
-	char *reqfile = aiWriteRequestFile(body);
-	free(body);
-	if (!reqfile) return NULL;
-
-	char *cmd = malloc(4096);
-	if (!cmd) { free(reqfile); return NULL; }
-
-	switch (type) {
-	case AI_PROVIDER_OLLAMA:
-		snprintf(cmd, 4096,
-			"curl -s -X POST %s/api/chat -H 'Content-Type: application/json' --data @%s 2>/dev/null",
-			endpoint, reqfile);
-		break;
-	case AI_PROVIDER_ANTHROPIC:
-		if (!api_key) { free(cmd); free(reqfile); return NULL; }
-		snprintf(cmd, 4096,
-			(E.ai_stream && !E.ai_tools_enabled)
-				? "curl -sN -X POST %s/v1/messages -H 'Content-Type: application/json' -H 'x-api-key: %s' -H 'anthropic-version: 2023-06-01' -H 'accept: text/event-stream' --data @%s 2>/dev/null"
-				: "curl -s -X POST %s/v1/messages -H 'Content-Type: application/json' -H 'x-api-key: %s' -H 'anthropic-version: 2023-06-01' --data @%s 2>/dev/null",
-			endpoint, api_key, reqfile);
-		break;
-	case AI_PROVIDER_OPENAI:
-		if (!api_key) { free(cmd); free(reqfile); return NULL; }
-		snprintf(cmd, 4096,
-			"curl -s -X POST %s/v1/chat/completions -H 'Content-Type: application/json' -H 'Authorization: Bearer %s' --data @%s 2>/dev/null",
-			endpoint, api_key, reqfile);
-		break;
-	default: break;
-	}
-
-	free(reqfile);
-	return cmd;
-}
-
-
-char *aiExtractResponse(const char *json, enum aiProviderType type) {
-	if (!json) return NULL;
-
-	const char *search_key = NULL;
-	switch (type) {
-	case AI_PROVIDER_OLLAMA:
-		search_key = "\"content\":\"";
-		break;
-	case AI_PROVIDER_ANTHROPIC:
-		search_key = "\"text\":\"";
-		break;
-	case AI_PROVIDER_OPENAI:
-		search_key = "\"content\":\"";
-		break;
-	default:
-		return NULL;
-	}
-
-	char *start = strstr(json, search_key);
-	if (!start) {
-		char *err = strstr(json, "\"error\"");
-		if (err) {
-			char *msg = strstr(err, "\"message\":\"");
-			if (msg) {
-				msg += 11;
-				char *end = strchr(msg, '"');
-				if (end) {
-					int len = end - msg;
-					char *result = malloc(len + 8);
-					snprintf(result, len + 8, "Error: %.*s", len, msg);
-					return result;
-				}
-			}
-		}
-		return strdup("Error: Could not parse response");
-	}
-
-	start += strlen(search_key);
-
-	int cap = 4096;
-	char *result = malloc(cap);
-	int len = 0;
-
-	while (*start && !(*start == '"' && *(start - 1) != '\\')) {
-		if (len >= cap - 4) {
-			cap *= 2;
-			result = realloc(result, cap);
-		}
-		if (*start == '\\' && *(start + 1)) {
-			start++;
-			switch (*start) {
-			case 'n': result[len++] = '\n'; break;
-			case 't': result[len++] = '\t'; break;
-			case '"': result[len++] = '"'; break;
-			case '\\': result[len++] = '\\'; break;
-			case '/': result[len++] = '/'; break;
-			default: result[len++] = '\\'; result[len++] = *start; break;
-			}
-		} else {
-			result[len++] = *start;
-		}
-		start++;
-	}
-	result[len] = '\0';
-
-	return result;
-}
-
-static char *hkReadFileAll(const char *path, long max_bytes) {
-	FILE *fp = fopen(path, "r");
-	if (!fp) return NULL;
-	fseek(fp, 0, SEEK_END);
-	long sz = ftell(fp);
-	fseek(fp, 0, SEEK_SET);
-	if (sz < 0) { fclose(fp); return NULL; }
-	if (max_bytes > 0 && sz > max_bytes) sz = max_bytes;
-	char *buf = malloc(sz + 1);
-	if (!buf) { fclose(fp); return NULL; }
-	fread(buf, 1, sz, fp);
-	buf[sz] = '\0';
-	fclose(fp);
-	return buf;
-}
-
-static char *hkRunShellCapture(const char *cmd, long max_bytes) {
-	char full[2048];
-	snprintf(full, sizeof(full), "timeout 10 sh -c %c%s%c 2>&1", '"', cmd, '"');
-	FILE *fp = popen(full, "r");
-	if (!fp) return strdup("error: popen failed");
-	char *out = NULL;
-	size_t total = 0;
-	char buf[4096];
-	while (fgets(buf, sizeof(buf), fp)) {
-		int n = strlen(buf);
-		if (max_bytes > 0 && (long)(total + n) > max_bytes) n = max_bytes - total;
-		if (n <= 0) break;
-		out = realloc(out, total + n + 1);
-		memcpy(out + total, buf, n);
-		total += n;
-	}
-	pclose(fp);
-	if (!out) return strdup("");
-	out[total] = '\0';
-	return out;
-}
-
-static char *hkListDir(const char *path) {
-	DIR *d = opendir(path);
-	if (!d) return NULL;
-	char *out = NULL;
-	size_t total = 0;
-	struct dirent *e;
-	while ((e = readdir(d))) {
-		if (strcmp(e->d_name, ".") == 0 || strcmp(e->d_name, "..") == 0) continue;
-		int n = strlen(e->d_name);
-		out = realloc(out, total + n + 2);
-		memcpy(out + total, e->d_name, n);
-		out[total + n] = '\n';
-		total += n + 1;
-	}
-	closedir(d);
-	if (!out) return strdup("");
-	out[total] = '\0';
-	return out;
-}
+static int   g_claw_fd_write      = -1;
+static FILE *g_claw_fp_read       = NULL;
+static pid_t g_claw_pid           = -1;
+static pthread_t g_claw_reader;
+static int g_claw_reader_running  = 0;
+static aiData *g_claw_data        = NULL;
 
 static char *hkExtractJsonString(const char *src, const char *key) {
 	char pat[64];
@@ -8857,783 +7520,455 @@ static int hkExtractJsonInt(const char *src, const char *key) {
 	return atoi(p);
 }
 
-static void hkUpdateUsage(aiData *data, const char *resp) {
-	if (!data || !resp) return;
-	int in = hkExtractJsonInt(resp, "input_tokens");
-	int out = hkExtractJsonInt(resp, "output_tokens");
-	if (in < 0) in = hkExtractJsonInt(resp, "prompt_tokens");
-	if (out < 0) out = hkExtractJsonInt(resp, "completion_tokens");
-	if (in < 0) in = hkExtractJsonInt(resp, "prompt_eval_count");
-	if (out < 0) out = hkExtractJsonInt(resp, "eval_count");
-	if (in >= 0) { data->last_in_tokens = in; data->total_in_tokens += in; }
-	if (out >= 0) { data->last_out_tokens = out; data->total_out_tokens += out; }
+static void clawJsonEsc(const char *src, char *dst, int dsz) {
+	int d = 0;
+	for (const char *p = src; *p && d < dsz - 2; p++) {
+		unsigned char c = (unsigned char)*p;
+		if      (c == '"')  { if (d < dsz-3) { dst[d++]='\\'; dst[d++]='"';  } }
+		else if (c == '\\') { if (d < dsz-3) { dst[d++]='\\'; dst[d++]='\\'; } }
+		else if (c == '\n') { if (d < dsz-3) { dst[d++]='\\'; dst[d++]='n';  } }
+		else if (c == '\r') { if (d < dsz-3) { dst[d++]='\\'; dst[d++]='r';  } }
+		else if (c == '\t') { if (d < dsz-3) { dst[d++]='\\'; dst[d++]='t';  } }
+		else                { dst[d++] = (char)c; }
+	}
+	dst[d] = '\0';
 }
 
-static char *hkExtractJsonObject(const char *src, const char *key) {
-	char pat[64];
-	snprintf(pat, sizeof(pat), "\"%s\":{", key);
-	const char *p = strstr(src, pat);
-	if (!p) return NULL;
-	p += strlen(pat) - 1;
-	int depth = 0;
-	const char *start = p;
-	int in_str = 0, esc = 0;
-	while (*p) {
-		if (esc) { esc = 0; p++; continue; }
-		if (*p == '\\') { esc = 1; p++; continue; }
-		if (*p == '"') in_str = !in_str;
-		else if (!in_str) {
-			if (*p == '{') depth++;
-			else if (*p == '}') { depth--; if (depth == 0) { p++; break; } }
-		}
-		p++;
+static void clawSendLine(const char *json) {
+	if (g_claw_fd_write < 0) return;
+	size_t len = strlen(json);
+	ssize_t w1 = write(g_claw_fd_write, json, len);
+	ssize_t w2 = write(g_claw_fd_write, "\n", 1);
+	if (w1 < 0 || w2 < 0) {
+		/* pipe broken — hakoc died. mark as gone so further sends no-op. */
+		close(g_claw_fd_write);
+		g_claw_fd_write = -1;
 	}
-	int len = p - start;
-	char *out = malloc(len + 1);
-	memcpy(out, start, len);
-	out[len] = '\0';
-	return out;
 }
 
-static int hkResolveInProject(const char *path, char *out_full, size_t out_cap) {
-	if (!path || !*path) return -1;
-	char cwd[PATH_MAX];
-	if (!getcwd(cwd, sizeof(cwd))) return -1;
-	char resolved[PATH_MAX];
-	char parent[PATH_MAX];
-	snprintf(parent, sizeof(parent), "%s", path);
-	char *slash = strrchr(parent, '/');
-	const char *filename_part = NULL;
-	if (slash) {
-		*slash = '\0';
-		filename_part = slash + 1;
-		if (!realpath(parent[0] ? parent : ".", resolved)) return -1;
-	} else {
-		strncpy(resolved, cwd, sizeof(resolved));
-		resolved[sizeof(resolved) - 1] = '\0';
-		filename_part = path;
-	}
-	int cwd_len = strlen(cwd);
-	if (strncmp(resolved, cwd, cwd_len) != 0 ||
-		(resolved[cwd_len] != '\0' && resolved[cwd_len] != '/')) return -1;
-	if (filename_part && *filename_part)
-		snprintf(out_full, out_cap, "%s/%s", resolved, filename_part);
-	else
-		snprintf(out_full, out_cap, "%s", resolved);
-	return 0;
+/* history helpers — display only; hakoc owns the API message stack */
+
+void aiAddHistory(aiData *data, const char *text);
+
+static void aiPushHistoryLine(aiData *data, const char *text, int len, unsigned char role) {
+	if (data->history_count >= AI_HISTORY_MAX) return;
+	char *line = malloc(len + 1);
+	if (!line) return;
+	memcpy(line, text, len);
+	line[len] = '\0';
+	data->history_role[data->history_count] = role;
+	data->history[data->history_count++] = line;
 }
 
-static char *hkReadOpenFile(const char *path) {
-	if (!path) return NULL;
-	editorPane **panes = NULL;
-	int count = 0;
-	editorCollectLeafPanes(E.root_pane, &panes, &count);
-	char *out = NULL;
-	for (int i = 0; i < count; i++) {
-		editorPane *p = panes[i];
-		if (p->type != PANE_EDITOR || !p->filename) continue;
-		const char *f = p->filename;
-		const char *slash = strrchr(f, '/');
-		const char *base = slash ? slash + 1 : f;
-		if (strcmp(f, path) == 0 || strcmp(base, path) == 0) {
-			size_t total = 0;
-			for (int r = 0; r < p->numrows; r++) total += p->row[r].size + 1;
-			out = malloc(total + 1);
-			size_t off = 0;
-			for (int r = 0; r < p->numrows; r++) {
-				memcpy(out + off, p->row[r].chars, p->row[r].size);
-				off += p->row[r].size;
-				out[off++] = '\n';
-			}
-			out[off] = '\0';
-			break;
-		}
+static void aiAddHistoryLine(aiData *data, const char *text, int text_len, unsigned char role) {
+	int max_width = 60;
+	if (text_len <= 0) { aiPushHistoryLine(data, "", 0, role); return; }
+	if (text_len <= max_width) { aiPushHistoryLine(data, text, text_len, role); return; }
+	int pos = 0;
+	while (pos < text_len) {
+		if (data->history_count >= AI_HISTORY_MAX) break;
+		int end = pos + max_width;
+		if (end >= text_len) { aiPushHistoryLine(data, text + pos, text_len - pos, role); break; }
+		int wrap = end;
+		while (wrap > pos && text[wrap] != ' ') wrap--;
+		if (wrap == pos) wrap = end;
+		aiPushHistoryLine(data, text + pos, wrap - pos, role);
+		pos = wrap;
+		while (pos < text_len && text[pos] == ' ') pos++;
 	}
-	free(panes);
-	return out;
 }
 
-static char *hkListOpenFiles(void) {
-	editorPane **panes = NULL;
-	int count = 0;
-	editorCollectLeafPanes(E.root_pane, &panes, &count);
-	size_t cap = 256, len = 0;
-	char *out = malloc(cap);
-	out[0] = '\0';
-	for (int i = 0; i < count; i++) {
-		editorPane *p = panes[i];
-		if (p->type != PANE_EDITOR || !p->filename) continue;
-		size_t fl = strlen(p->filename);
-		if (len + fl + 16 >= cap) { cap = (len + fl + 16) * 2; out = realloc(out, cap); }
-		len += snprintf(out + len, cap - len, "%s%s", p->filename, p->dirty ? " (modified)\n" : "\n");
+void aiAddHistoryRole(aiData *data, const char *text, unsigned char role) {
+	if (!data || !text) return;
+	if (data->history_count > 0 && data->history_count < AI_HISTORY_MAX - 1) {
+		unsigned char prev = data->history_role[data->history_count - 1];
+		int role_swap = (prev != role) &&
+		    (prev == HK_ROLE_USER || prev == HK_ROLE_AI ||
+		     role == HK_ROLE_USER || role == HK_ROLE_AI);
+		char *prev_text = data->history[data->history_count - 1];
+		if (role_swap && prev_text && *prev_text != '\0')
+			aiPushHistoryLine(data, "", 0, HK_ROLE_SYSTEM);
 	}
-	free(panes);
-	if (len == 0) { free(out); return strdup("(no files open)"); }
-	return out;
+	const char *p = text;
+	while (1) {
+		const char *nl = strchr(p, '\n');
+		int seg = nl ? (int)(nl - p) : (int)strlen(p);
+		aiAddHistoryLine(data, p, seg, role);
+		if (!nl) break;
+		p = nl + 1;
+	}
 }
 
-typedef struct hkToolDef {
-	const char *name;
-	const char *description;
-	const char *props;
-	const char *required;
-} hkToolDef;
-
-static const hkToolDef HK_TOOLS[] = {
-	{"read_file",
-	 "Read contents of a file inside the project directory.",
-	 "\"path\":{\"type\":\"string\"}",
-	 "\"path\""},
-	{"list_dir",
-	 "List entries in a directory inside the project.",
-	 "\"path\":{\"type\":\"string\"}",
-	 "\"path\""},
-	{"list_open_files",
-	 "List files currently open in editor panes (with modification status).",
-	 "",
-	 ""},
-	{"read_open_file",
-	 "Read live (possibly unsaved) buffer of a file open in an editor pane. Match by full path or basename.",
-	 "\"path\":{\"type\":\"string\"}",
-	 "\"path\""},
-	{"write_file",
-	 "Create or overwrite a file in the trusted project directory.",
-	 "\"path\":{\"type\":\"string\"},\"content\":{\"type\":\"string\"}",
-	 "\"path\",\"content\""},
-	{"run_shell",
-	 "Run a non-interactive shell command. 10s timeout. Requires project trust.",
-	 "\"cmd\":{\"type\":\"string\"}",
-	 "\"cmd\""},
-};
-static const int HK_TOOL_COUNT = sizeof(HK_TOOLS) / sizeof(HK_TOOLS[0]);
-
-static char *hkBuildToolsSchema(int provider_format) {
-	size_t cap = 4096, len = 0;
-	char *out = malloc(cap);
-	out[len++] = '[';
-	for (int i = 0; i < HK_TOOL_COUNT; i++) {
-		const hkToolDef *t = &HK_TOOLS[i];
-		if (i > 0) { if (len + 1 >= cap) { cap *= 2; out = realloc(out, cap); } out[len++] = ','; }
-		size_t need = len + strlen(t->name) + strlen(t->description) + strlen(t->props) + strlen(t->required) + 256;
-		if (need >= cap) { while (cap < need) cap *= 2; out = realloc(out, cap); }
-		const char *props = t->props;
-		const char *req_close = (*t->required) ? "],\"required\":[" : "";
-		const char *req_close_end = (*t->required) ? "]" : "";
-		if (provider_format == 0) {
-			len += snprintf(out + len, cap - len,
-				"{\"name\":\"%s\",\"description\":\"%s\",\"input_schema\":{\"type\":\"object\",\"properties\":{%s}%s%s%s}}",
-				t->name, t->description, props,
-				(*t->required) ? ",\"required\":[" : "",
-				t->required, req_close_end);
-		} else {
-			len += snprintf(out + len, cap - len,
-				"{\"type\":\"function\",\"function\":{\"name\":\"%s\",\"description\":\"%s\",\"parameters\":{\"type\":\"object\",\"properties\":{%s}%s%s%s}}}",
-				t->name, t->description, props,
-				(*t->required) ? ",\"required\":[" : "",
-				t->required, req_close_end);
-		}
-		(void)req_close;
-	}
-	if (len + 2 >= cap) { cap += 4; out = realloc(out, cap); }
-	out[len++] = ']';
-	out[len] = '\0';
-	return out;
+void aiAddHistory(aiData *data, const char *text) {
+	aiAddHistoryRole(data, text, HK_ROLE_SYSTEM);
 }
 
-static char *hkExecTool(const char *name, const char *input_json) {
-	if (strcmp(name, "read_file") == 0) {
-		char *path = hkExtractJsonString(input_json, "path");
-		if (!path) return strdup("error: missing path");
-		char full[PATH_MAX];
-		if (hkResolveInProject(path, full, sizeof(full)) != 0) {
-			free(path);
-			return strdup("error: path outside project");
-		}
-		free(path);
-		char *c = hkReadFileAll(full, 100000);
-		return c ? c : strdup("error: cannot read");
-	}
-	if (strcmp(name, "list_dir") == 0) {
-		char *path = hkExtractJsonString(input_json, "path");
-		if (!path) return strdup("error: missing path");
-		char full[PATH_MAX];
-		if (hkResolveInProject(path, full, sizeof(full)) != 0) {
-			free(path);
-			return strdup("error: path outside project");
-		}
-		free(path);
-		char *c = hkListDir(full);
-		return c ? c : strdup("error: cannot list");
-	}
-	if (strcmp(name, "read_open_file") == 0) {
-		char *path = hkExtractJsonString(input_json, "path");
-		if (!path) return strdup("error: missing path");
-		char *c = hkReadOpenFile(path);
-		free(path);
-		return c ? c : strdup("error: file not open in any editor pane");
-	}
-	if (strcmp(name, "list_open_files") == 0) {
-		return hkListOpenFiles();
-	}
-	if (strcmp(name, "run_shell") == 0) {
-		if (!hkProjectTrusted()) return strdup("error: project not trusted");
-		char *shcmd = hkExtractJsonString(input_json, "cmd");
-		if (!shcmd) return strdup("error: missing cmd");
-		char *c = hkRunShellCapture(shcmd, 50000);
-		free(shcmd);
-		return c;
-	}
-	if (strcmp(name, "write_file") == 0) {
-		if (!hkProjectTrusted()) return strdup("error: project not trusted");
-		char *path = hkExtractJsonString(input_json, "path");
-		char *content = hkExtractJsonString(input_json, "content");
-		if (!path || !content) {
-			free(path); free(content);
-			return strdup("error: missing path or content");
-		}
-		char full[PATH_MAX];
-		if (hkResolveInProject(path, full, sizeof(full)) != 0) {
-			free(path); free(content);
-			return strdup("error: path outside trusted project");
-		}
-		size_t clen = strlen(content);
-		int new_lines = 0;
-		for (size_t i = 0; i < clen; i++) if (content[i] == '\n') new_lines++;
-		if (clen > 0 && content[clen - 1] != '\n') new_lines++;
-		long old_size = -1;
-		int old_lines = 0;
-		FILE *ef = fopen(full, "r");
-		if (ef) {
-			fseek(ef, 0, SEEK_END);
-			old_size = ftell(ef);
-			fseek(ef, 0, SEEK_SET);
-			int ch;
-			while ((ch = fgetc(ef)) != EOF) if (ch == '\n') old_lines++;
-			fclose(ef);
-		}
-		if (!E.ai_autowrite) {
-			char pending[PATH_MAX + 16];
-			snprintf(pending, sizeof(pending), "%s.hako-pending", full);
-			FILE *fp = fopen(pending, "w");
-			if (!fp) { free(path); free(content); return strdup("error: cannot stage pending"); }
-			fwrite(content, 1, clen, fp);
-			fclose(fp);
-			char *out = malloc(512);
-			snprintf(out, 512, "preview staged at %s (new %zu bytes/%d lines, old %ld/%d). ai_autowrite=0; user must `mv` pending to apply.",
-				pending, clen, new_lines, old_size, old_lines);
-			free(path); free(content);
-			return out;
-		}
-		FILE *fp = fopen(full, "w");
-		if (!fp) { free(path); free(content); return strdup("error: cannot open for write"); }
-		size_t wrote = fwrite(content, 1, clen, fp);
-		fclose(fp);
-		char *out = malloc(256);
-		snprintf(out, 256, "wrote %zu bytes to %s (new %d lines, old %d)", wrote, full, new_lines, old_lines);
-		free(path); free(content);
-		return out;
-	}
-	return strdup("error: unknown tool");
-}
+static void clawHandleEvent(aiData *data, const char *line) {
+	char *type = hkExtractJsonString(line, "type");
+	if (!type) return;
 
-static void hkAnnounceTool(aiData *data, const char *fname, const char *args_obj);
-static void hkAnnounceToolResult(aiData *data, const char *result);
+	if (strcmp(type, "init") == 0) {
+		char *session  = hkExtractJsonString(line, "session");
+		int   resumed  = hkExtractJsonInt(line, "resumed");
+		int   turns    = hkExtractJsonInt(line, "turns");
+		char *provider = hkExtractJsonString(line, "provider");
+		char *model    = hkExtractJsonString(line, "model");
 
-static char *hkBuildToolResults(aiData *data, const char *content_array) {
-	char *out = malloc(32);
-	int cap = 32, len = 0;
-	out[0] = '[';
-	len = 1;
-	const char *p = content_array;
-	int first = 1;
-	while ((p = strstr(p, "\"type\":\"tool_use\""))) {
-		const char *block_start = p;
-		while (block_start > content_array && *block_start != '{') block_start--;
-		char *id = hkExtractJsonString(block_start, "id");
-		char *name = hkExtractJsonString(block_start, "name");
-		char *input_obj = hkExtractJsonObject(block_start, "input");
-		if (!id || !name || !input_obj) {
-			free(id); free(name); free(input_obj);
-			p++; continue;
-		}
-		hkAnnounceTool(data, name, input_obj);
-		char *result = hkExecTool(name, input_obj);
-		hkAnnounceToolResult(data, result);
-		int rlen = strlen(result);
-		char *esc = malloc(rlen * 6 + 8);
-		hkJsonEscapeInto(result, esc, rlen * 6 + 8);
-		int need = len + strlen(id) + strlen(esc) + 128;
-		if (need >= cap) { while (cap < need) cap *= 2; out = realloc(out, cap); }
-		if (!first) out[len++] = ',';
-		first = 0;
-		len += snprintf(out + len, cap - len,
-			"{\"type\":\"tool_result\",\"tool_use_id\":\"%s\",\"content\":\"%s\"}",
-			id, esc);
-		free(id); free(name); free(input_obj); free(result); free(esc);
-		p++;
-	}
-	if (len + 2 >= cap) { cap += 4; out = realloc(out, cap); }
-	out[len++] = ']';
-	out[len] = '\0';
-	return out;
-}
+		free(E.claw_session_id);
+		E.claw_session_id      = session ? session : strdup("");
+		E.claw_session_turns   = turns > 0 ? turns : 0;
+		E.claw_session_resumed = resumed > 0 ? 1 : 0;
 
-static void hkAnnounceTool(aiData *data, const char *fname, const char *args_obj) {
-	char arg_summary[128] = "";
-	char *path = hkExtractJsonString(args_obj, "path");
-	char *cmd = hkExtractJsonString(args_obj, "cmd");
-	if (path) { snprintf(arg_summary, sizeof(arg_summary), "%s", path); free(path); }
-	else if (cmd) { snprintf(arg_summary, sizeof(arg_summary), "%.80s", cmd); free(cmd); }
-	char msg[256];
-	snprintf(msg, sizeof(msg), "→ %s(%s)", fname, arg_summary);
-	pthread_mutex_lock(&data->lock);
-	aiAddHistory(data, msg);
-	pthread_mutex_unlock(&data->lock);
-}
-
-static void hkAnnounceToolResult(aiData *data, const char *result) {
-	int len = result ? (int)strlen(result) : 0;
-	int is_err = result && strncmp(result, "error:", 6) == 0;
-	char msg[128];
-	if (is_err) snprintf(msg, sizeof(msg), "  %s", result);
-	else snprintf(msg, sizeof(msg), "  ← %d bytes", len);
-	pthread_mutex_lock(&data->lock);
-	aiAddHistory(data, msg);
-	pthread_mutex_unlock(&data->lock);
-}
-
-static char *hkJsonUnescape(const char *s, int n);
-
-static int hkFnToolExecAll(aiData *data, const char *response) {
-	const char *p = strstr(response, "\"tool_calls\":[");
-	if (!p) return 0;
-	int count = 0;
-	while ((p = strstr(p, "\"function\""))) {
-		char *fname = hkExtractJsonString(p, "name");
-		char *args_obj = hkExtractJsonObject(p, "arguments");
-		if (!args_obj) {
-			char *args_str = hkExtractJsonString(p, "arguments");
-			if (args_str) {
-				args_obj = hkJsonUnescape(args_str, (int)strlen(args_str));
-				free(args_str);
-			}
-		}
-		if (!fname || !args_obj) { free(fname); free(args_obj); p++; continue; }
-		hkAnnounceTool(data, fname, args_obj);
-		char *result = hkExecTool(fname, args_obj);
-		hkAnnounceToolResult(data, result);
 		pthread_mutex_lock(&data->lock);
-		aiPushMessage(data, "tool", result ? result : "");
-		pthread_mutex_unlock(&data->lock);
-		free(fname); free(args_obj); free(result);
-		count++;
-		p++;
-	}
-	return count;
-}
-
-static char *hkExtractContentArray(const char *response) {
-	const char *p = strstr(response, "\"content\":[");
-	if (!p) return NULL;
-	p += strlen("\"content\":") ;
-	const char *start = p;
-	int depth = 0, in_str = 0, esc = 0;
-	while (*p) {
-		if (esc) { esc = 0; p++; continue; }
-		if (*p == '\\') { esc = 1; p++; continue; }
-		if (*p == '"') in_str = !in_str;
-		else if (!in_str) {
-			if (*p == '[') depth++;
-			else if (*p == ']') { depth--; if (depth == 0) { p++; break; } }
+		char info[256];
+		if (provider && *provider) {
+			snprintf(info, sizeof(info), "provider: %s%s%s",
+				provider,
+				(model && *model) ? "  model: " : "",
+				(model && *model) ? model : "");
+			aiAddHistory(data, info);
 		}
-		p++;
+		if (E.claw_session_resumed && E.claw_session_turns > 0) {
+			snprintf(info, sizeof(info), "session: resumed (%d turns)", E.claw_session_turns);
+			aiAddHistory(data, info);
+		} else {
+			aiAddHistory(data, "session: new");
+		}
+		data->history_pos = MAX(0, data->history_count - 20);
+		pthread_mutex_unlock(&data->lock);
+
+		free(provider);
+		free(model);
+
+	} else if (strcmp(type, "message") == 0) {
+		char *role = hkExtractJsonString(line, "role");
+		char *text = hkExtractJsonString(line, "text");
+		if (text) {
+			unsigned char hrole = HK_ROLE_SYSTEM;
+			if (role && strcmp(role, "ai")   == 0) hrole = HK_ROLE_AI;
+			if (role && strcmp(role, "user") == 0) hrole = HK_ROLE_USER;
+			pthread_mutex_lock(&data->lock);
+			/* close any open streaming slot before adding a full message */
+			if (data->stream_slot >= 0) {
+				free(data->history[data->stream_slot]);
+				data->history[data->stream_slot] = NULL;
+				data->history_count = data->stream_slot;
+				if (data->stream_acc) {
+					aiAddHistoryRole(data, data->stream_acc, HK_ROLE_AI);
+					free(data->stream_acc);
+					data->stream_acc     = NULL;
+					data->stream_acc_len = 0;
+				}
+				data->stream_slot = -1;
+			}
+			aiAddHistoryRole(data, text, hrole);
+			data->history_pos = MAX(0, data->history_count - 20);
+			pthread_mutex_unlock(&data->lock);
+			free(text);
+		}
+		free(role);
+
+	} else if (strcmp(type, "tool_start") == 0 || strcmp(type, "tool_end") == 0) {
+		char *display = hkExtractJsonString(line, "display");
+		if (display) {
+			pthread_mutex_lock(&data->lock);
+			aiAddHistory(data, display);
+			data->history_pos = MAX(0, data->history_count - 20);
+			pthread_mutex_unlock(&data->lock);
+			free(display);
+		}
+
+	} else if (strcmp(type, "done") == 0) {
+		int in      = hkExtractJsonInt(line, "in");
+		int out     = hkExtractJsonInt(line, "out");
+		int turn    = hkExtractJsonInt(line, "turn");
+		char *session = hkExtractJsonString(line, "session");
+
+		free(E.claw_session_id);
+		E.claw_session_id    = session ? session : strdup("");
+		E.claw_session_turns = turn > 0 ? turn : E.claw_session_turns;
+
+		pthread_mutex_lock(&data->lock);
+		if (data->stream_slot >= 0) {
+			free(data->history[data->stream_slot]);
+			data->history[data->stream_slot] = NULL;
+			data->history_count = data->stream_slot;
+			if (data->stream_acc) {
+				aiAddHistoryRole(data, data->stream_acc, HK_ROLE_AI);
+				free(data->stream_acc);
+				data->stream_acc     = NULL;
+				data->stream_acc_len = 0;
+			}
+			data->stream_slot = -1;
+		}
+		if (in > 0) {
+			data->last_in_tokens   = in;
+			data->last_out_tokens  = out > 0 ? out : 0;
+			data->total_in_tokens  += in;
+			data->total_out_tokens += out > 0 ? out : 0;
+		}
+		data->streaming   = 0;
+		data->history_pos = MAX(0, data->history_count - 20);
+		pthread_mutex_unlock(&data->lock);
+
+	} else if (strcmp(type, "error") == 0) {
+		char *msg = hkExtractJsonString(line, "message");
+		pthread_mutex_lock(&data->lock);
+		if (data->stream_slot >= 0) {
+			free(data->history[data->stream_slot]);
+			data->history[data->stream_slot] = NULL;
+			data->history_count = data->stream_slot;
+			free(data->stream_acc);
+			data->stream_acc     = NULL;
+			data->stream_acc_len = 0;
+			data->stream_slot    = -1;
+		}
+		aiAddHistory(data, msg ? msg : "Error: unknown");
+		data->streaming   = 0;
+		data->history_pos = MAX(0, data->history_count - 20);
+		pthread_mutex_unlock(&data->lock);
+		free(msg);
 	}
-	int len = p - start;
-	char *out = malloc(len + 1);
-	memcpy(out, start, len);
-	out[len] = '\0';
-	return out;
+
+	free(type);
 }
 
-void *aiWorkerThread(void *arg) {
+static void *clawReaderThread(void *arg) {
 	aiData *data = (aiData *)arg;
-
-	pthread_mutex_lock(&data->lock);
-	char *prompt = data->current_prompt ? strdup(data->current_prompt) : NULL;
-	if (prompt) aiPushMessage(data, "user", prompt);
-	pthread_mutex_unlock(&data->lock);
-	free(prompt);
-
-	int max_iters = 6;
-	int iter = 0;
-	int used_tool = 0;
-
-	while (iter++ < max_iters) {
-		pthread_mutex_lock(&data->lock);
-		char *cmd = aiBuildCurlCommand(data, E.ai_provider_type);
-		pthread_mutex_unlock(&data->lock);
-
-		if (!cmd) {
-			pthread_mutex_lock(&data->lock);
-			aiAddHistory(data, "Error: Provider not configured.");
-			data->streaming = 0;
-			pthread_mutex_unlock(&data->lock);
-			return NULL;
-		}
-
-		FILE *fp = popen(cmd, "r");
-		free(cmd);
-		if (!fp) {
-			pthread_mutex_lock(&data->lock);
-			aiAddHistory(data, "Error: Could not execute curl");
-			data->streaming = 0;
-			pthread_mutex_unlock(&data->lock);
-			return NULL;
-		}
-
-		int streaming_mode = (E.ai_provider_type == AI_PROVIDER_ANTHROPIC
-			&& E.ai_stream && !E.ai_tools_enabled);
-
-		char buffer[8192];
-		char *full_response = NULL;
-		size_t total = 0;
-
-		if (streaming_mode) {
-			pthread_mutex_lock(&data->lock);
-			int stream_idx = data->history_count;
-			if (stream_idx < AI_HISTORY_MAX) {
-				data->history_role[stream_idx] = HK_ROLE_AI;
-				data->history[stream_idx] = strdup("");
-				data->history_count++;
-			} else {
-				stream_idx = -1;
-			}
-			pthread_mutex_unlock(&data->lock);
-
-			char *acc = calloc(1, 1);
-			size_t acc_len = 0;
-
-			while (fgets(buffer, sizeof(buffer), fp)) {
-				int blen = strlen(buffer);
-				full_response = realloc(full_response, total + blen + 1);
-				memcpy(full_response + total, buffer, blen);
-				total += blen;
-
-				if (strncmp(buffer, "data: ", 6) != 0) continue;
-				const char *payload = buffer + 6;
-				if (!strstr(payload, "content_block_delta")) continue;
-				char *text = hkExtractJsonString(payload, "text");
-				if (!text) continue;
-
-				size_t tlen = strlen(text);
-				acc = realloc(acc, acc_len + tlen + 1);
-				memcpy(acc + acc_len, text, tlen);
-				acc_len += tlen;
-				acc[acc_len] = '\0';
-				free(text);
-
-				if (stream_idx >= 0) {
-					pthread_mutex_lock(&data->lock);
-					free(data->history[stream_idx]);
-					char *disp = strdup(acc);
-					if (disp) {
-						for (char *q = disp; *q; q++) if (*q == '\n') *q = ' ';
-					}
-					data->history[stream_idx] = disp;
-					data->history_pos = MAX(0, data->history_count - 20);
-					pthread_mutex_unlock(&data->lock);
-				}
-			}
-			pclose(fp);
-			if (full_response) full_response[total] = '\0';
-
-			if (acc_len > 0) {
-				pthread_mutex_lock(&data->lock);
-				hkUpdateUsage(data, full_response);
-				if (stream_idx >= 0 && stream_idx == data->history_count - 1) {
-					free(data->history[stream_idx]);
-					data->history[stream_idx] = NULL;
-					data->history_count--;
-					aiAddHistoryRole(data, acc, HK_ROLE_AI);
-					data->history_pos = MAX(0, data->history_count - 20);
-				}
-				aiPushMessage(data, "assistant", acc);
-				hkLogMessage("assistant", acc);
-				free(data->current_response);
-				data->current_response = acc;
-				pthread_mutex_unlock(&data->lock);
-			} else {
-				free(acc);
-				pthread_mutex_lock(&data->lock);
-				aiAddHistory(data, "Error: Empty stream");
-				pthread_mutex_unlock(&data->lock);
-			}
-
-			free(full_response);
-			break;
-		}
-
-		while (fgets(buffer, sizeof(buffer), fp)) {
-			int blen = strlen(buffer);
-			full_response = realloc(full_response, total + blen + 1);
-			memcpy(full_response + total, buffer, blen);
-			total += blen;
-		}
-		pclose(fp);
-		if (full_response) full_response[total] = '\0';
-
-		int tool_use_anthropic = E.ai_provider_type == AI_PROVIDER_ANTHROPIC
-			&& full_response
-			&& strstr(full_response, "\"stop_reason\":\"tool_use\"");
-		int tool_use_fn = (E.ai_provider_type == AI_PROVIDER_OLLAMA || E.ai_provider_type == AI_PROVIDER_OPENAI)
-			&& full_response
-			&& strstr(full_response, "\"tool_calls\":[");
-
-		char *content = aiExtractResponse(full_response, E.ai_provider_type);
-
-		pthread_mutex_lock(&data->lock);
-		hkUpdateUsage(data, full_response);
-		if (content && *content) {
-			aiAddHistoryRole(data, content, HK_ROLE_AI);
-			hkLogMessage("assistant", content);
-			free(data->current_response);
-			data->current_response = strdup(content);
-		}
-		pthread_mutex_unlock(&data->lock);
-
-		if (tool_use_anthropic) {
-			char *content_array = hkExtractContentArray(full_response);
-			if (!content_array) { free(content); free(full_response); break; }
-
-			pthread_mutex_lock(&data->lock);
-			aiPushMessageRaw(data, "assistant", content_array);
-			pthread_mutex_unlock(&data->lock);
-
-			char *results = hkBuildToolResults(data, content_array);
-
-			pthread_mutex_lock(&data->lock);
-			aiPushMessageRaw(data, "user", results);
-			pthread_mutex_unlock(&data->lock);
-
-			free(content_array);
-			free(results);
-			free(content);
-			free(full_response);
-			used_tool = 1;
-			continue;
-		}
-
-		if (tool_use_fn) {
-			pthread_mutex_lock(&data->lock);
-			aiPushMessage(data, "assistant", content && *content ? content : "(calling tools)");
-			pthread_mutex_unlock(&data->lock);
-
-			int n = hkFnToolExecAll(data, full_response);
-			(void)n;
-
-			free(content);
-			free(full_response);
-			if (n == 0) break;
-			used_tool = 1;
-			continue;
-		}
-
-		if (content) {
-			pthread_mutex_lock(&data->lock);
-			aiPushMessage(data, "assistant", content);
-			pthread_mutex_unlock(&data->lock);
-		} else {
-			pthread_mutex_lock(&data->lock);
-			aiAddHistory(data, "Error: Empty response");
-			pthread_mutex_unlock(&data->lock);
-		}
-
-		free(content);
-		free(full_response);
-		break;
+	char line[65536];
+	while (g_claw_fp_read && fgets(line, sizeof(line), g_claw_fp_read)) {
+		int len = (int)strlen(line);
+		while (len > 0 && (line[len-1] == '\n' || line[len-1] == '\r')) line[--len] = '\0';
+		if (len == 0) continue;
+		clawHandleEvent(data, line);
+		E.full_redraw_pending = 1;
 	}
-
 	pthread_mutex_lock(&data->lock);
-	if (iter >= max_iters && used_tool) aiAddHistory(data, "(tool loop cap reached)");
 	data->streaming = 0;
-	data->history_pos = MAX(0, data->history_count - 20);
 	pthread_mutex_unlock(&data->lock);
-
+	g_claw_reader_running = 0;
 	return NULL;
 }
 
-void aiWorkerSend(aiData *data) {
-	if (!data || data->streaming) return;
+static char *clawFindBinary(void) {
+	char buf[PATH_MAX];
 
-	data->streaming = 1;
-	pthread_t thread;
-	if (pthread_create(&thread, NULL, aiWorkerThread, data) == 0) {
-		pthread_detach(thread);
-	} else {
-		data->streaming = 0;
+	/* 1. Same dir as the running hako binary (bundled install). */
+#ifdef __APPLE__
+	{
+		uint32_t sz = sizeof(buf);
+		if (_NSGetExecutablePath(buf, &sz) == 0) {
+			char real[PATH_MAX];
+			if (realpath(buf, real)) {
+				char *slash = strrchr(real, '/');
+				if (slash) {
+					*slash = '\0';
+					char cand[PATH_MAX];
+					snprintf(cand, sizeof(cand), "%s/hakoc", real);
+					if (access(cand, X_OK) == 0) return strdup(cand);
+				}
+			}
+		}
 	}
+#elif defined(__linux__)
+	{
+		ssize_t n = readlink("/proc/self/exe", buf, sizeof(buf) - 1);
+		if (n > 0) {
+			buf[n] = '\0';
+			char *slash = strrchr(buf, '/');
+			if (slash) {
+				*slash = '\0';
+				char cand[PATH_MAX];
+				snprintf(cand, sizeof(cand), "%s/hakoc", buf);
+				if (access(cand, X_OK) == 0) return strdup(cand);
+			}
+		}
+	}
+#endif
+
+	/* 2. cwd/hakoc (dev convenience). */
+	if (access("./hakoc", X_OK) == 0) return strdup("./hakoc");
+
+	/* 3. ~/.local/bin/hakoc */
+	const char *home = getenv("HOME");
+	if (home) {
+		snprintf(buf, sizeof(buf), "%s/.local/bin/hakoc", home);
+		if (access(buf, X_OK) == 0) return strdup(buf);
+	}
+
+	/* 4. /usr/local/bin/hakoc */
+	if (access("/usr/local/bin/hakoc", X_OK) == 0) return strdup("/usr/local/bin/hakoc");
+
+	/* 5. PATH lookup (execvp will search). */
+	return strdup("hakoc");
 }
 
-void editorGenerateConfig() {
-	const char *home = getenv("HOME");
-	if (!home) {
-		editorSetStatusMessage("Cannot find HOME directory");
+static int clawLaunch(aiData *data) {
+#ifdef _WIN32
+	(void)data;
+	return -1;
+#else
+	char *bin = clawFindBinary();
+	int to_child[2], from_child[2];
+	if (pipe(to_child)   < 0 ||
+	    pipe(from_child) < 0) { free(bin); return -1; }
+	pid_t pid = fork();
+	if (pid < 0) {
+		close(to_child[0]);   close(to_child[1]);
+		close(from_child[0]); close(from_child[1]);
+		free(bin); return -1;
+	}
+	if (pid == 0) {
+		dup2(to_child[0],   STDIN_FILENO);
+		dup2(from_child[1], STDOUT_FILENO);
+		close(to_child[0]);   close(to_child[1]);
+		close(from_child[0]); close(from_child[1]);
+		char *argv[] = {bin, "--pipe", NULL};
+		execvp(bin, argv);
+		_exit(127);
+	}
+	close(to_child[0]);
+	close(from_child[1]);
+	free(bin);
+	g_claw_fd_write     = to_child[1];
+	g_claw_fp_read      = fdopen(from_child[0], "r");
+	g_claw_pid          = pid;
+	g_claw_data         = data;
+	g_claw_reader_running = 1;
+	if (pthread_create(&g_claw_reader, NULL, clawReaderThread, data) != 0) {
+		fclose(g_claw_fp_read); g_claw_fp_read  = NULL;
+		close(g_claw_fd_write); g_claw_fd_write = -1;
+		g_claw_pid            = -1;
+		g_claw_reader_running = 0;
+		return -1;
+	}
+	pthread_detach(g_claw_reader);
+	return 0;
+#endif
+}
+
+static void clawShutdown(void) {
+#ifndef _WIN32
+	if (g_claw_fd_write >= 0) {
+		const char *quit = "{\"type\":\"quit\"}\n";
+		ssize_t w = write(g_claw_fd_write, quit, strlen(quit));
+		(void)w;
+		close(g_claw_fd_write);
+		g_claw_fd_write = -1;
+	}
+	if (g_claw_fp_read) {
+		fclose(g_claw_fp_read);
+		g_claw_fp_read = NULL;
+	}
+	if (g_claw_pid > 0) {
+		/* graceful: hakoc sees quit on stdin or EOF, exits.
+		   If still alive after a beat, SIGTERM. Reap to avoid zombie. */
+		for (int i = 0; i < 20; i++) {
+			pid_t r = waitpid(g_claw_pid, NULL, WNOHANG);
+			if (r == g_claw_pid || r < 0) break;
+			usleep(10000); /* 10ms */
+		}
+		if (waitpid(g_claw_pid, NULL, WNOHANG) == 0) {
+			kill(g_claw_pid, SIGTERM);
+			waitpid(g_claw_pid, NULL, 0);
+		}
+		g_claw_pid = -1;
+	}
+	g_claw_reader_running = 0;
+	g_claw_data           = NULL;
+#endif
+}
+
+void aiWorkerSend(aiData *data) {
+	if (!data) return;
+	if (data->streaming) return;
+	if (g_claw_fd_write < 0) {
+		pthread_mutex_lock(&data->lock);
+		aiAddHistory(data, "Rei not connected. Close and reopen (:q rei, then :rei).");
+		pthread_mutex_unlock(&data->lock);
 		return;
 	}
-	
+	data->streaming = 1;
+	char esc[8192];
+	clawJsonEsc(data->current_prompt ? data->current_prompt : "", esc, sizeof(esc));
+	char json[8256];
+	snprintf(json, sizeof(json), "{\"type\":\"prompt\",\"text\":\"%s\"}", esc);
+	clawSendLine(json);
+}
+
+int hkHandleSlash(aiData *data, const char *prompt) {
+	if (!data) return 0;
+	if (strcmp(prompt, "/quit") == 0 || strcmp(prompt, "/q") == 0) return 2;
+	if (g_claw_fd_write < 0) {
+		pthread_mutex_lock(&data->lock);
+		aiAddHistory(data, "Rei not connected.");
+		pthread_mutex_unlock(&data->lock);
+		return 0;
+	}
+	char esc[4096];
+	clawJsonEsc(prompt, esc, sizeof(esc));
+	char json[4160];
+	snprintf(json, sizeof(json), "{\"type\":\"slash\",\"cmd\":\"%s\"}", esc);
+	data->streaming = 1;
+	clawSendLine(json);
+	return 0;
+}
+
+void editorGenerateConfig(void) {
+	const char *home = getenv("HOME");
+	if (!home) { editorSetStatusMessage("Cannot find HOME directory"); return; }
 	char path[512];
 	snprintf(path, sizeof(path), "%s/.hakorc", home);
-	
 	FILE *fp = fopen(path, "w");
-	if (!fp) {
-		editorSetStatusMessage("Cannot create config file: %s", strerror(errno));
-		return;
-	}
-	
+	if (!fp) { editorSetStatusMessage("Cannot create config file: %s", strerror(errno)); return; }
+
 	fprintf(fp, "# 箱 Hako Configuration\n");
-	fprintf(fp, "# Every knob is listed below. Uncomment to change.\n");
-	fprintf(fp, "# Last-wins: later values override earlier ones.\n\n");
+	fprintf(fp, "# Every knob is listed below. Uncomment to change.\n\n");
 
 	fprintf(fp, "# ============================================================\n");
 	fprintf(fp, "#  Editor basics\n");
 	fprintf(fp, "# ============================================================\n\n");
-
-	fprintf(fp, "# Tab width in columns.\n");
-	fprintf(fp, "tab_stop=4\n\n");
-
-	fprintf(fp, "# 1 = real tab char. 0 = expand tabs to spaces.\n");
-	fprintf(fp, "use_tabs=1\n\n");
-
-	fprintf(fp, "# 1 = soft-wrap long lines. 0 = horizontal scroll.\n");
-	fprintf(fp, "word_wrap=1\n\n");
-
-	fprintf(fp, "# 0=off, 1=absolute, 2=relative.\n");
-	fprintf(fp, "show_line_numbers=1\n\n");
-
-	fprintf(fp, "# Undo stack depth.\n");
-	fprintf(fp, "max_undo_levels=100\n\n");
-
-	fprintf(fp, "# Match previous line's indent when opening a new line.\n");
-	fprintf(fp, "auto_indent=1\n\n");
-
-	fprintf(fp, "# Add one indent level after '{', ':', etc.\n");
-	fprintf(fp, "smart_indent=1\n\n");
-
-	fprintf(fp, "# Mouse click-to-position + scroll wheel.\n");
-	fprintf(fp, "mouse_enabled=1\n\n");
-
-	fprintf(fp, "# Lines per mouse-wheel tick.\n");
+	fprintf(fp, "tab_stop=4\n");
+	fprintf(fp, "use_tabs=1\n");
+	fprintf(fp, "word_wrap=1\n");
+	fprintf(fp, "show_line_numbers=1\n");
+	fprintf(fp, "max_undo_levels=100\n");
+	fprintf(fp, "auto_indent=1\n");
+	fprintf(fp, "smart_indent=1\n");
+	fprintf(fp, "mouse_enabled=1\n");
 	fprintf(fp, "scroll_speed=3\n\n");
 
 	fprintf(fp, "# ============================================================\n");
 	fprintf(fp, "#  紙 Kami — file explorer (left panel)\n");
 	fprintf(fp, "# ============================================================\n\n");
-
-	fprintf(fp, "# Show explorer panel at startup.\n");
-	fprintf(fp, "explorer_enabled=1\n\n");
-
-	fprintf(fp, "# Panel width in columns (10-60).\n");
-	fprintf(fp, "explorer_width=30\n\n");
-
-	fprintf(fp, "# Show dotfiles in explorer.\n");
+	fprintf(fp, "explorer_enabled=1\n");
+	fprintf(fp, "explorer_width=30\n");
 	fprintf(fp, "explorer_show_hidden=0\n\n");
 
 	fprintf(fp, "# ============================================================\n");
 	fprintf(fp, "#  零 Rei — AI assistant (right panel)\n");
+	fprintf(fp, "#  Rei is powered by hakoc. Configure AI in ~/.hakocrc\n");
+	fprintf(fp, "#  Run: hakoc --help  |  man page: https://mithraeums.github.io\n");
 	fprintf(fp, "# ============================================================\n\n");
-
-	fprintf(fp, "# Provider: ollama | anthropic | openai\n");
-	fprintf(fp, "# (anthropic also accepts 'claude', openai also accepts 'gpt' or 'groq')\n");
-	fprintf(fp, "ai_provider=ollama\n\n");
-
-	fprintf(fp, "# API key. Leave blank for ollama (local).\n");
-	fprintf(fp, "ai_api_key=\n\n");
-
-	fprintf(fp, "# Endpoint root (scheme + host). Paths appended per provider.\n");
-	fprintf(fp, "#   ollama    -> http://localhost:11434\n");
-	fprintf(fp, "#   anthropic -> https://api.anthropic.com\n");
-	fprintf(fp, "#   openai    -> https://api.openai.com\n");
-	fprintf(fp, "#   groq      -> https://api.groq.com/openai\n");
-	fprintf(fp, "ai_endpoint=http://localhost:11434\n\n");
-
-	fprintf(fp, "# Model id.\n");
-	fprintf(fp, "#   ollama    -> llama3.2, codellama, mistral, qwen2.5-coder, ...\n");
-	fprintf(fp, "#   anthropic -> claude-sonnet-4-20250514, claude-opus-4-20250514, ...\n");
-	fprintf(fp, "#   openai    -> gpt-4o-mini, gpt-4o, o1-mini, ...\n");
-	fprintf(fp, "#   groq      -> llama-3.1-70b-versatile, mixtral-8x7b-32768, ...\n");
-	fprintf(fp, "ai_model=llama3.2\n\n");
-
-	fprintf(fp, "# Max tokens per response.\n");
-	fprintf(fp, "ai_max_tokens=2048\n\n");
-
-	fprintf(fp, "# Function-calling / tool loop (Anthropic only for now).\n");
-	fprintf(fp, "# 1 = read_file/list_dir/run_shell available to the model.\n");
-	fprintf(fp, "ai_tools_enabled=1\n\n");
-
-	fprintf(fp, "# SSE token streaming. Auto-disabled when tools are on.\n");
-	fprintf(fp, "ai_stream=1\n\n");
 
 	fprintf(fp, "# ============================================================\n");
 	fprintf(fp, "#  Theme preset\n");
 	fprintf(fp, "# ============================================================\n");
-	fprintf(fp, "# Dark:  dark, gruvbox, nord, dracula, monokai, solarized,\n");
-	fprintf(fp, "#        tokyonight, catppuccin, onedark, material,\n");
-	fprintf(fp, "#        everforest, rosepine, github-dark, ayu, kanagawa\n");
-	fprintf(fp, "# Light: light, github-light\n");
+	fprintf(fp, "# dark, gruvbox, nord, dracula, monokai, solarized,\n");
+	fprintf(fp, "# tokyonight, catppuccin, onedark, material,\n");
+	fprintf(fp, "# everforest, rosepine, github-dark, ayu, kanagawa,\n");
+	fprintf(fp, "# light, github-light\n");
 	fprintf(fp, "theme=dark\n\n");
 
 	fprintf(fp, "# ============================================================\n");
 	fprintf(fp, "#  Custom colors (RGB 0-255). Override preset values.\n");
 	fprintf(fp, "# ============================================================\n\n");
-
-	fprintf(fp, "# Surfaces\n");
 	fprintf(fp, "# theme_bg=30,30,30\n");
-	fprintf(fp, "# theme_fg=212,212,212\n\n");
-
-	fprintf(fp, "# Syntax\n");
+	fprintf(fp, "# theme_fg=212,212,212\n");
 	fprintf(fp, "# theme_comment=106,153,85\n");
 	fprintf(fp, "# theme_keyword1=86,156,214\n");
-	fprintf(fp, "# theme_keyword2=78,201,176\n");
-	fprintf(fp, "# theme_string=206,145,120\n");
-	fprintf(fp, "# theme_number=181,206,168\n\n");
+	fprintf(fp, "# theme_status_bg=50,50,50\n\n");
 
-	fprintf(fp, "# Chrome\n");
-	fprintf(fp, "# theme_line_number=133,133,133\n");
-	fprintf(fp, "# theme_status_bg=50,50,50\n");
-	fprintf(fp, "# theme_status_fg=212,212,212\n");
-	fprintf(fp, "# theme_border=80,80,80\n");
-	fprintf(fp, "# theme_visual_bg=38,79,120\n");
-	fprintf(fp, "# theme_visual_fg=255,255,255\n\n");
-
-	fprintf(fp, "# ============================================================\n");
-	fprintf(fp, "#  Starter combos — uncomment one block\n");
-	fprintf(fp, "# ============================================================\n\n");
-
-	fprintf(fp, "# --- Prose ---\n");
-	fprintf(fp, "# theme=github-light\n");
-	fprintf(fp, "# show_line_numbers=0\n");
-	fprintf(fp, "# word_wrap=1\n");
-	fprintf(fp, "# explorer_enabled=0\n\n");
-
-	fprintf(fp, "# --- Keyboard-only C ---\n");
-	fprintf(fp, "# theme=gruvbox\n");
-	fprintf(fp, "# tab_stop=4\n");
-	fprintf(fp, "# show_line_numbers=2\n");
-	fprintf(fp, "# mouse_enabled=0\n\n");
-
-	fprintf(fp, "# --- Local LLM dev ---\n");
-	fprintf(fp, "# theme=kanagawa\n");
-	fprintf(fp, "# ai_provider=ollama\n");
-	fprintf(fp, "# ai_model=qwen2.5-coder\n");
-	fprintf(fp, "# ai_tools_enabled=0\n\n");
-
-	fprintf(fp, "# --- Remote agentic ---\n");
-	fprintf(fp, "# theme=tokyonight\n");
-	fprintf(fp, "# ai_provider=anthropic\n");
-	fprintf(fp, "# ai_model=claude-sonnet-4-20250514\n");
-	fprintf(fp, "# ai_tools_enabled=1\n");
-	fprintf(fp, "# ai_stream=0\n\n");
-	
 	fclose(fp);
 	editorSetStatusMessage("Config created: %s", path);
 }
@@ -9641,7 +7976,22 @@ void editorGenerateConfig() {
 /*** init ***/
 int editorApplyThemeByName(const char *name) {
 	if (!name) return 0;
-	if (strcmp(name, "dark") == 0) {
+	if (strcmp(name, "mithraeum") == 0) {
+		E.theme_preset = THEME_MITHRAEUM;
+		E.theme.bg           = (Color){15, 14, 12};
+		E.theme.fg           = (Color){232, 223, 200};
+		E.theme.comment      = (Color){122, 113, 101};
+		E.theme.keyword1     = (Color){201, 169, 97};
+		E.theme.keyword2     = (Color){138, 154, 108};
+		E.theme.string       = (Color){168, 84, 59};
+		E.theme.number       = (Color){184, 137, 90};
+		E.theme.line_number  = (Color){58, 53, 48};
+		E.theme.status_bg    = (Color){26, 24, 20};
+		E.theme.status_fg    = (Color){201, 169, 97};
+		E.theme.border       = (Color){58, 53, 48};
+		E.theme.visual_bg    = (Color){42, 37, 32};
+		E.theme.visual_fg    = (Color){232, 223, 200};
+	} else if (strcmp(name, "dark") == 0) {
 		E.theme_preset = THEME_DARK;
 		E.theme.bg = (Color){30, 30, 30};
 		E.theme.fg = (Color){212, 212, 212};
@@ -9904,36 +8254,34 @@ int editorApplyThemeByName(const char *name) {
 	return 1;
 }
 
+/* Mithraeum default — void/paper/gold/rust. Matches site banners + claw/hako icons. */
 void initTheme() {
-	E.theme.bg = (Color){30, 30, 30};
-	E.theme.fg = (Color){212, 212, 212};
-	E.theme.comment = (Color){106, 153, 85};
-	E.theme.keyword1 = (Color){86, 156, 214};
-	E.theme.keyword2 = (Color){78, 201, 176};
-	E.theme.string = (Color){206, 145, 120};
-	E.theme.number = (Color){181, 206, 168};
-	E.theme.match = (Color){255, 255, 0};
-	E.theme.preprocessor = (Color){197, 134, 192};
-	E.theme.function = (Color){220, 220, 170};
-	E.theme.type = (Color){78, 201, 176};
-	E.theme.operator = (Color){212, 212, 212};
-	E.theme.bracket = (Color){218, 112, 214};
-	E.theme.line_number = (Color){133, 133, 133};
-	E.theme.status_bg = (Color){50, 50, 50};
-	E.theme.status_fg = (Color){212, 212, 212};
-	E.theme.border = (Color){80, 80, 80};
-	E.theme.visual_bg = (Color){38, 79, 120};
-	E.theme.visual_fg = (Color){255, 255, 255};
-	E.theme.constant = (Color){86, 156, 214};
-	E.theme.builtin = (Color){220, 220, 170};
-	E.theme.attribute = (Color){156, 220, 254};
-	E.theme.char_literal = (Color){224, 108, 117};
-	E.theme.escape = (Color){209, 154, 102};
-	E.theme.label = (Color){198, 120, 221};
-	E.theme.ai_bg = (Color){25, 25, 25};
-	E.theme.ai_fg = (Color){200, 200, 200};
-	E.theme.ai_prompt = (Color){100, 200, 100};
-	E.theme.ai_response = (Color){150, 150, 200};
+	E.theme_preset = THEME_MITHRAEUM;
+	E.theme.bg           = (Color){15, 14, 12};       /* void */
+	E.theme.fg           = (Color){232, 223, 200};    /* paper */
+	E.theme.comment      = (Color){122, 113, 101};    /* dim chalk */
+	E.theme.keyword1     = (Color){201, 169, 97};     /* gold */
+	E.theme.keyword2     = (Color){138, 154, 108};    /* sage */
+	E.theme.string       = (Color){168, 84, 59};      /* rust */
+	E.theme.number       = (Color){184, 137, 90};     /* bronze */
+	E.theme.match        = (Color){228, 196, 120};    /* bright gold */
+	E.theme.preprocessor = (Color){184, 152, 90};
+	E.theme.function     = (Color){232, 223, 200};    /* paper */
+	E.theme.type         = (Color){138, 154, 108};    /* sage */
+	E.theme.operator     = (Color){232, 223, 200};
+	E.theme.bracket      = (Color){156, 133, 80};     /* dim gold */
+	E.theme.line_number  = (Color){58, 53, 48};       /* spring */
+	E.theme.status_bg    = (Color){26, 24, 20};
+	E.theme.status_fg    = (Color){201, 169, 97};     /* gold */
+	E.theme.border       = (Color){58, 53, 48};       /* spring */
+	E.theme.visual_bg    = (Color){42, 37, 32};
+	E.theme.visual_fg    = (Color){232, 223, 200};
+	E.theme.constant     = (Color){201, 169, 97};     /* gold */
+	E.theme.builtin      = (Color){138, 154, 108};    /* sage */
+	E.theme.attribute    = (Color){184, 137, 90};     /* bronze */
+	E.theme.char_literal = (Color){168, 84, 59};      /* rust */
+	E.theme.escape       = (Color){212, 181, 114};
+	E.theme.label        = (Color){168, 84, 59};
 }
 
 void editorLoadConfig() {
@@ -9956,7 +8304,7 @@ void editorLoadConfig() {
 		if (fp) E.config_path = strdup(config_paths[i]);
 	}
 
-	if (!fp) { hkLoadSession(); return; }
+	if (!fp) { return; }
 
 	char *line = NULL;
 	size_t len = 0;
@@ -10007,26 +8355,9 @@ void editorLoadConfig() {
 			E.explorer_show_hidden = atoi(val);
 		} else if (strcmp(key, "theme") == 0) {
 			editorApplyThemeByName(val);
-		} else if (strcmp(key, "ai_provider") == 0) {
-			hkApplyProviderAlias(val);
-		} else if (strcmp(key, "ai_api_key") == 0) {
-			free(E.ai_api_key);
-			if (strlen(val) > 0) E.ai_api_key = strdup(val);
-		} else if (strcmp(key, "ai_endpoint") == 0) {
-			free(E.ai_endpoint);
-			if (strlen(val) > 0) E.ai_endpoint = strdup(val);
-		} else if (strcmp(key, "ai_model") == 0) {
-			free(E.ai_model);
-			if (strlen(val) > 0) E.ai_model = strdup(val);
-		} else if (strcmp(key, "ai_max_tokens") == 0) {
-			E.ai_max_tokens = atoi(val);
-			if (E.ai_max_tokens < 1) E.ai_max_tokens = 2048;
-		} else if (strcmp(key, "ai_tools_enabled") == 0) {
-			E.ai_tools_enabled = atoi(val) ? 1 : 0;
-		} else if (strcmp(key, "ai_stream") == 0) {
-			E.ai_stream = atoi(val) ? 1 : 0;
-		} else if (strcmp(key, "ai_autowrite") == 0) {
-			E.ai_autowrite = atoi(val) ? 1 : 0;
+		} else if (strncmp(key, "ai_", 3) == 0) {
+			/* AI config moved to ~/.hakocrc (read by hakoc) */
+			(void)val;
 		} else if (strncmp(key, "theme_", 6) == 0) {
 			int r, g, b;
 			if (sscanf(val, "%d,%d,%d", &r, &g, &b) == 3) {
@@ -10048,7 +8379,6 @@ void editorLoadConfig() {
 	}
 	free(line);
 	fclose(fp);
-	hkLoadSession();
 }
 
 void initEditor() {
@@ -10187,7 +8517,6 @@ void editorCleanup() {
 	free(E.explorer_name);
 	free(E.ai_kanji);
 	free(E.ai_name);
-	free(E.session_id);
 
 	editorCleanupAI();
 	gridFree();
@@ -10218,6 +8547,8 @@ int main(int argc, char *argv[]) {
 	if (sigaction(SIGWINCH, &sa, NULL) == -1) {
 		die("sigaction");
 	}
+	/* hakoc subprocess can die mid-turn — don't let SIGPIPE kill the editor */
+	signal(SIGPIPE, SIG_IGN);
 #endif
 
 	if (argc >= 2) {
@@ -10225,12 +8556,7 @@ int main(int argc, char *argv[]) {
 		editorOpen(argv[1]);
 	}
 
-	if (E.session_resumed && E.session_id) {
-		editorSetStatusMessage("HAKO v%s | resumed session %s (%d turns) | /sessions to switch",
-			HAKO_VERSION, E.session_id, E.session_turn_count);
-	} else {
-		editorSetStatusMessage("HAKO v%s | :help for commands", HAKO_VERSION);
-	}
+	editorSetStatusMessage("HAKO v%s | :help for commands", HAKO_VERSION);
 	while (1) {
 		editorRefreshScreen();
 		editorProcessKeyPress();
